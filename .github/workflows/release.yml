@@ -1,0 +1,45 @@
+name: Release
+
+# Push a tag like v0.5.1 (after bumping `version` in Cargo.toml to match) and this builds
+# Island.exe on Windows and attaches it to a GitHub release. The game's auto-updater downloads
+# that file for everyone.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "Tag v$tag does not match Cargo.toml version $ver" }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item target/release/island.exe Island.exe
+          $hash = (Get-FileHash Island.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  Island.exe" | Out-File -Encoding ascii Island.exe.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Island.exe
+            Island.exe.sha256
+          generate_release_notes: true

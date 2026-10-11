@@ -1,4 +1,4 @@
-//! Key bindings, settings and the immediate-mode UI toolkit.
+﻿//! Key bindings, settings and the immediate-mode UI toolkit.
 
 use super::*;
 use std::path::PathBuf;
@@ -247,6 +247,8 @@ pub struct Settings {
     pub vsync: bool,
     /// "owner/name" of the GitHub repository that publishes releases
     pub update_repo: String,
+    /// the player's chosen name (empty = "Player N")
+    pub name: String,
 }
 
 impl Settings {
@@ -272,6 +274,7 @@ impl Settings {
             auto_update: true,
             vsync: true,
             update_repo: crate::update::DEFAULT_REPO.to_string(),
+            name: String::new(),
         };
         s.apply_preset(2);
         s
@@ -337,6 +340,7 @@ impl Settings {
                     "detail" => s.detail = v.parse::<usize>().unwrap_or(2).min(3),
                     "auto_update" => s.auto_update = bo(),
                     "vsync" => s.vsync = bo(),
+                    "name" => s.name = crate::net::clean_name(v),
                     "update_repo" => {
                         if v.contains('/') && v.len() < 100 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.') {
                             s.update_repo = v.to_string();
@@ -366,7 +370,7 @@ impl Settings {
         t += &format!("res={}\nfullscreen={}\nfps={}\npreset={}\ndraw_dist={}\nwater_q={}\nbump={}\n", self.res, b(self.fullscreen), self.fps, self.preset, self.draw_dist, self.water_q, b(self.bump));
         t += &format!("show_fps={}\nshow_clock={}\nshow_hints={}\nsens={}\ninvert_y={}\nfov={}\n", b(self.show_fps), b(self.show_clock), b(self.show_hints), self.sens, b(self.invert_y), self.fov);
         t += &format!("detail={}\nlook={}\nvolume={}\n", self.detail.min(3), self.look, self.volume);
-        t += &format!("auto_update={}\nupdate_repo={}\nvsync={}\n", b(self.auto_update), self.update_repo, b(self.vsync));
+        t += &format!("auto_update={}\nupdate_repo={}\nvsync={}\nname={}\n", b(self.auto_update), self.update_repo, b(self.vsync), self.name);
         for (i, a) in ACTS.iter().enumerate() {
             t += &format!("bind.{}={}\n", act_id(*a), bind_to_str(self.binds[i]));
         }
@@ -664,11 +668,14 @@ pub struct HotbarEntry {
     pub tier: usize,
     /// lantern flame on (only meaningful for the lantern)
     pub lit: bool,
+    /// which species (only meaningful for a fish)
+    pub fish: usize,
 }
 
 fn item_cols(k: crate::items::ItemKind) -> (Color, Color, &'static str) {
     use crate::items::ItemKind as K;
     match k {
+        K::Fish => (rgb(0.08, 0.17, 0.26), rgb(0.20, 0.45, 0.62), "FISH"),
         K::Rod => (rgb(0.08, 0.20, 0.19), rgb(0.17, 0.52, 0.42), "ROD"),
         K::Coconut => (rgb(0.20, 0.15, 0.07), rgb(0.50, 0.42, 0.17), "COCONUT"),
         K::Lantern => (rgb(0.30, 0.15, 0.05), rgb(0.86, 0.48, 0.10), "LANTERN"),
@@ -823,8 +830,40 @@ fn icon_bucket(ix: f32, iy: f32, z: f32) {
     draw_circle(eye.x, eye.y - 0.01 * z, 0.014 * z, BLACK);
 }
 
+/// A little fish picture in the species' own colours.
+fn icon_fish(ix: f32, iy: f32, z: f32, sp: usize, tm: f32) {
+    let s = &crate::fish::SPECIES[sp.min(crate::fish::N_SPECIES - 1)];
+    let c = |a: [f32; 3], k: f32| rgb((a[0] * k).min(1.0), (a[1] * k).min(1.0), (a[2] * k).min(1.0));
+    let p = |a: f32, b: f32| vec2(ix + a * z, iy + b * z);
+    if sp == crate::fish::BOOT {
+        let leather = rgb(0.30, 0.21, 0.13);
+        draw_rectangle(ix + 0.30 * z, iy + 0.18 * z, 0.22 * z, 0.45 * z, leather);
+        draw_ellipse(ix + 0.52 * z, iy + 0.66 * z, 0.30 * z, 0.14 * z, 0.0, leather);
+        draw_rectangle(ix + 0.26 * z, iy + 0.76 * z, 0.58 * z, 0.06 * z, rgb(0.14, 0.10, 0.07));
+        draw_rectangle(ix + 0.28 * z, iy + 0.16 * z, 0.26 * z, 0.05 * z, rgb(0.20, 0.17, 0.11));
+        return;
+    }
+    let wag = (tm * 3.0).sin() * 0.04;
+    let tail = [p(0.20, 0.5 + wag), p(0.04, 0.30 + wag), p(0.04, 0.70 + wag)];
+    draw_triangle(tail[0], tail[1], tail[2], c(s.fin, 1.0));
+    // body: belly colour below, back colour above
+    let h = (s.hb * 2.4).clamp(0.12, 0.34);
+    draw_ellipse(ix + 0.52 * z, iy + 0.5 * z, 0.34 * z, h * z, 0.0, c(s.belly, 1.0));
+    draw_ellipse(ix + 0.52 * z, iy + (0.5 - h * 0.28) * z, 0.34 * z, h * 0.72 * z, 0.0, c(s.back, 1.0));
+    draw_triangle(p(0.40, 0.5 - h * 0.9), p(0.62, 0.5 - h * 0.9), p(0.48, 0.5 - h * 1.5), c(s.fin, 1.0));
+    draw_circle(ix + 0.74 * z, iy + 0.45 * z, 0.032 * z, if s.glow_eye { c(s.eye, 1.0) } else { WHITE });
+    draw_circle(ix + 0.75 * z, iy + 0.45 * z, 0.016 * z, BLACK);
+    if s.teeth > 0 {
+        for k in 0..3 {
+            let x = 0.80 + 0.04 * k as f32;
+            draw_triangle(p(x, 0.52), p(x + 0.03, 0.52), p(x + 0.015, 0.58), WHITE);
+        }
+    }
+}
+
 fn draw_tile(x: f32, y: f32, ss: f32, hh: f32, hs: f32, e: &HotbarEntry, sel: bool, tm: f32) {
     let (top, bot, name) = item_cols(e.kind);
+    let name = if e.kind == crate::items::ItemKind::Fish { crate::fish::SPECIES[e.fish.min(crate::fish::N_SPECIES - 1)].name } else { name };
     let k = if sel { 0.10 } else { 0.0 };
     // soft shadow
     draw_rectangle(x + 1.5 * hs, y + 3.0 * hs, ss, ss, rgba(0.0, 0.0, 0.0, 0.35));
@@ -832,7 +871,7 @@ fn draw_tile(x: f32, y: f32, ss: f32, hh: f32, hs: f32, e: &HotbarEntry, sel: bo
     // header strip
     draw_rectangle(x, y, ss, hh, rgba(0.02, 0.03, 0.05, 0.62));
     let label = if matches!(e.kind, crate::items::ItemKind::Rod) {
-        format!("{} {}", name, ["I", "II", "III"][e.tier.min(2)])
+        format!("{} {}", name, ["I", "II", "III", "IV"][e.tier.min(3)])
     } else {
         name.to_string()
     };
@@ -855,6 +894,7 @@ fn draw_tile(x: f32, y: f32, ss: f32, hh: f32, hs: f32, e: &HotbarEntry, sel: bo
         K::Lantern => icon_lantern(ix, iy, isz, e.lit, tm),
         K::Bait => icon_bait(ix, iy, isz),
         K::Bucket => icon_bucket(ix, iy, isz),
+        K::Fish => icon_fish(ix, iy, isz, e.fish, tm),
     }
     // count badge
     if let Some(n) = e.count {
@@ -1444,12 +1484,43 @@ pub fn tab_controls(ui: &mut Ui, st: &mut Settings, rebinding: &mut Option<usize
     }
 }
 
+/// A one-line text box for the player's name. Returns true when the text changed.
+#[allow(clippy::too_many_arguments)]
+pub fn name_field(ui: &mut Ui, name: &mut String, focus: &mut bool, x: f32, y: f32, w: f32, h: f32, t: f32) -> bool {
+    ui.rect(x, y, w, h, Color::new(0.1, 0.12, 0.16, 1.0));
+    ui.outline(x, y, w, h, 2.0, if *focus { COL_ACCENT } else { Color::new(1.0, 1.0, 1.0, 0.25) });
+    if ui.clicked {
+        *focus = ui.hover(x, y, w, h);
+    }
+    let empty = name.is_empty() && !*focus;
+    let shown = if empty { "Type your name".to_string() } else { format!("{}{}", name, if *focus && (t * 2.0) as i32 % 2 == 0 { "|" } else { "" }) };
+    ui.text(&shown, x + 12.0, y + (h - 22.0) * 0.5 - 1.0, 22.0, if empty { Color::new(1.0, 1.0, 1.0, 0.3) } else { WHITE });
+    let mut changed = false;
+    if *focus {
+        while let Some(ch) = get_char_pressed() {
+            if (ch.is_alphanumeric() || matches!(ch, ' ' | '_' | '-' | '.')) && name.chars().count() < 16 {
+                name.push(ch);
+                changed = true;
+            }
+        }
+        if is_key_pressed(KeyCode::Backspace) && name.pop().is_some() {
+            changed = true;
+        }
+        if is_key_pressed(KeyCode::Enter) {
+            *focus = false;
+        }
+    }
+    changed
+}
+
 /// Character customization controls plus the live 3D preview. `mat` is the world material.
 /// Draws a heading at y=66, 13 option rows from y=124 (pitch 36) on the left and a preview
 /// (276x480 design px, y=112) with Randomize / Reset below it at the right edge of `x..x+w`.
-pub fn tab_character(ui: &mut Ui, look: &mut Look, x: f32, w: f32, time: f32, mat: &Material) {
+pub fn tab_character(ui: &mut Ui, look: &mut Look, name: &mut String, name_focus: &mut bool, x: f32, w: f32, time: f32, mat: &Material) -> bool {
     use crate::people::{draw_preview, field_count, field_get, field_label, field_options, field_set};
     ui.text("Character", x, 66.0, 30.0, WHITE);
+    ui.text("Name", x + 180.0, 72.0, 20.0, Color::new(0.88, 0.92, 0.96, 1.0));
+    let name_changed = name_field(ui, name, name_focus, x + 240.0, 62.0, 250.0, 40.0, time);
     let pw = 276.0f32.min(w * 0.45);
     let ph = pw * 480.0 / 276.0;
     let rows_w = (w - pw - 24.0).min(480.0);
@@ -1520,6 +1591,7 @@ pub fn tab_character(ui: &mut Ui, look: &mut Look, x: f32, w: f32, time: f32, ma
     if ui.button(prx + pw - bw2, pry + ph + 12.0, bw2, 34.0, "Reset", true, false) {
         *look = Look::default_for(0);
     }
+    name_changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1616,6 +1688,7 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
     let mut rebinding: Option<usize> = None;
     let mut join_text = String::new();
     let mut join_focus = false;
+    let mut name_focus = false;
     let mut status = String::new();
     let mut hov = [0.0f32; 16];
     let mut confirm_new = -100.0f32;
@@ -1705,6 +1778,14 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                     st.save();
                     std::process::exit(0);
                 }
+                // the player's name (shown to friends in multiplayer)
+                ui.text("Your name", MB_X, 596.0, 18.0, rgb(0.86, 0.90, 0.94));
+                let was_focus = name_focus;
+                name_field(ui, &mut st.name, &mut name_focus, MB_X, 620.0, MB_W, 42.0, t);
+                if was_focus && !name_focus {
+                    st.name = crate::net::clean_name(&st.name);
+                    st.save();
+                }
                 ui.text(&format!("v{}  -  Esc: back   F11: fullscreen", crate::update::CURRENT), MB_X, 690.0, 15.0, rgba(1.0, 1.0, 1.0, 0.4));
             }
             Page::Settings => {
@@ -1793,7 +1874,7 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                 }
                 let mut ly = 470.0;
                 for line in [
-                    "Hosting and joining work on the same network, over a VPN such as Tailscale or Hamachi, or over the internet if the host forwards TCP port 47321.",
+                    "Hosting and joining work on the same network or over the internet - the host just shares the code the game shows. No router setup needed.",
                     "Windows may ask to allow the game through the firewall when you host.",
                 ] {
                     for l in wrap_lines(ui, line, 17.0, 640.0) {
@@ -1805,8 +1886,10 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
             }
             Page::Character => {
                 panel(ui, 190.0, 30.0, 900.0, 660.0);
-                tab_character(ui, look, 230.0, 820.0, t, mat);
+                tab_character(ui, look, &mut st.name, &mut name_focus, 230.0, 820.0, t, mat);
                 if ui.button(1090.0 - 140.0, 52.0, 120.0, 38.0, "Done", true, true) || esc {
+                    st.name = crate::net::clean_name(&st.name);
+                    name_focus = false;
                     st.look = look.encode();
                     st.save();
                     page = Page::Main;

@@ -1,7 +1,9 @@
 ﻿#![windows_subsystem = "windows"]
 
 mod audio;
+mod fish;
 mod items;
+mod boat;
 mod bore;
 mod net;
 mod people;
@@ -2606,7 +2608,7 @@ fn draw_fly(b: &Fly, time: f32, mb: &mut MB) {
 }
 
 // ---------------------------------------------------------------------------
-// Fish (swimming around, and the ones you catch)
+// Fish (swimming around; what you catch lives in fish.rs)
 // ---------------------------------------------------------------------------
 struct Swimmer {
     pos: Vec3,
@@ -2614,19 +2616,15 @@ struct Swimmer {
     speed: f32,
     phase: f32,
     depth: f32,
-    col: Vec3,
-    size: f32,
+    sp: usize,
+    len: f32,
+    /// one of the big deep-water monsters
+    monster: bool,
 }
 
 fn spawn_swimmers(t: &Terrain, dock: &Dock) -> Vec<Swimmer> {
     let mut v = vec![];
-    let palette = [
-        vec3(0.55, 0.66, 0.78),
-        vec3(0.70, 0.72, 0.74),
-        vec3(0.92, 0.55, 0.20),
-        vec3(0.90, 0.80, 0.25),
-        vec3(0.30, 0.45, 0.62),
-    ];
+    let kinds = [0usize, 0, 0, 1, 1, 1, 2, 2, 3, 5, 7];
     let mut tries = 0;
     while v.len() < 190 && tries < 40000 {
         tries += 1;
@@ -2639,82 +2637,71 @@ fn spawn_swimmers(t: &Terrain, dock: &Dock) -> Vec<Swimmer> {
         };
         let g = t.at(x, z);
         if g < -1.6 && g > -6.5 {
+            let sp = kinds[rand::gen_range(0, kinds.len())];
+            let kg = rf(fish::SPECIES[sp].kg.0, fish::SPECIES[sp].kg.1);
             v.push(Swimmer {
                 pos: vec3(x, -0.6, z),
                 heading: rf(0.0, TAU),
-                speed: rf(0.4, 1.2),
+                speed: rf(0.4, 1.2) * (1.0 + fish::SPECIES[sp].len * 0.3),
                 phase: rf(0.0, TAU),
                 depth: rf(0.55, 1.5),
-                col: palette[rand::gen_range(0, palette.len())],
-                size: rf(0.7, 1.5),
+                sp,
+                len: fish::fish_len(sp, kg),
+                monster: false,
             });
         }
     }
     v
 }
 
+/// The things that live in the deep water, far from the island.
+fn spawn_monsters(t: &Terrain) -> Vec<Swimmer> {
+    let mut v = vec![];
+    let mut tries = 0;
+    while v.len() < 7 && tries < 20000 {
+        tries += 1;
+        let a = rf(0.0, TAU);
+        let d = rf(70.0, 225.0);
+        let (x, z) = (a.cos() * d, a.sin() * d);
+        if t.at(x, z) < -6.9 && t.at(x + 8.0, z) < -6.9 && t.at(x, z + 8.0) < -6.9 {
+            let sp = 11 + (v.len() % 3);
+            let kg = rf(fish::SPECIES[sp].kg.0, fish::SPECIES[sp].kg.1);
+            v.push(Swimmer {
+                pos: vec3(x, -rf(3.0, 5.2), z),
+                heading: rf(0.0, TAU),
+                speed: rf(1.2, 2.0),
+                phase: rf(0.0, TAU),
+                depth: rf(3.0, 5.2),
+                sp,
+                len: fish::fish_len(sp, kg),
+                monster: true,
+            });
+        }
+    }
+    v
+}
+
+/// A dead fish for props (drying racks, the counter): a still, detailed fish of a shallow species.
+fn fish_shape(mb: &mut MB, pos: Vec3, heading: f32, size: f32, col: Vec3, _wag: f32) {
+    let idx = [1usize, 0, 2][((col.x * 10.0) as usize) % 3];
+    let len = fish::SPECIES[idx].len * size * 0.9;
+    fish::draw_fish(mb, idx, pos, len, &fish::FishPose { heading, pitch: 0.0, roll: 0.0, t: 0.0, amp: 0.0, open: 0.0 }, true);
+}
+
 fn update_swimmer(f: &mut Swimmer, t: &Terrain, dt: f32) {
-    f.heading += rf(-1.0, 1.0) * dt * 1.4;
+    let (lo, hi) = if f.monster { (-30.0, -6.6) } else { (-6.8, -1.4) };
+    f.heading += rf(-1.0, 1.0) * dt * if f.monster { 0.5 } else { 1.4 };
     let nx = f.pos.x + f.heading.cos() * f.speed * dt;
     let nz = f.pos.z + f.heading.sin() * f.speed * dt;
     let g = t.at(nx, nz);
-    if g > -1.4 || g < -6.8 {
+    if g > hi || g < lo {
         f.heading += PI * 0.65 + rf(-0.3, 0.3);
     } else {
         f.pos.x = nx;
         f.pos.z = nz;
     }
-    let y = (-f.depth).max(g + 0.3).min(-0.35);
+    let y = if f.monster { -f.depth } else { (-f.depth).max(g + 0.3).min(-0.35) };
     f.pos.y += (y - f.pos.y) * (dt * 2.0).min(1.0);
-}
-
-fn fish_shape(mb: &mut MB, pos: Vec3, heading: f32, size: f32, col: Vec3, wag: f32) {
-    let f = vec3(heading.cos(), 0.0, heading.sin());
-    let r = vec3(-heading.sin(), 0.0, heading.cos());
-    let len = 0.16 * size;
-    blob(mb, pos, vec3(len, len * 0.30, len * 0.22), col, 0.0, 7, 4, heading, shade);
-    // belly highlight
-    blob(mb, pos - Vec3::Y * len * 0.1, vec3(len * 0.9, len * 0.2, len * 0.2), col * 1.3 + Vec3::splat(0.12), 0.0, 6, 3, heading, shade);
-    // tail fin
-    let base = pos - f * len * 0.9;
-    let tip = base - f * len * 0.7 + r * wag * len * 0.5;
-    let k = shade(col * 0.9, Vec3::Y);
-    mb.tri(base, tip + Vec3::Y * len * 0.45, tip - Vec3::Y * len * 0.45, k, k, k);
-    // dorsal fin
-    let d0 = pos + Vec3::Y * len * 0.25 + f * len * 0.2;
-    mb.tri(d0, d0 - f * len * 0.6, d0 - f * len * 0.2 + Vec3::Y * len * 0.35, k, k, k);
-}
-
-const FISH_TABLE: [(&str, f32, f32, f32, [f32; 3]); 7] = [
-    ("Sardine", 0.1, 0.2, 38.0, [0.65, 0.72, 0.80]),
-    ("Mackerel", 0.6, 1.2, 25.0, [0.30, 0.50, 0.58]),
-    ("Red Snapper", 1.5, 3.0, 15.0, [0.85, 0.28, 0.24]),
-    ("Grouper", 4.0, 8.0, 8.0, [0.50, 0.42, 0.30]),
-    ("Yellowfin Tuna", 10.0, 25.0, 5.0, [0.30, 0.38, 0.55]),
-    ("Pufferfish", 0.8, 1.3, 6.0, [0.80, 0.72, 0.45]),
-    ("Old Boot", 0.5, 0.5, 3.0, [0.25, 0.18, 0.12]),
-];
-
-/// Sell value per kg (Old Boot is a flat price).
-const FISH_PRICE: [f32; 7] = [14.0, 11.0, 16.0, 13.0, 24.0, 12.0, 3.0];
-/// How "rare" each catch is, used to bias the draw when your luck is high.
-const FISH_RARITY: [f32; 7] = [0.0, 0.5, 1.0, 1.6, 2.4, 0.5, -1.0];
-
-fn pick_fish(luck: f32) -> (usize, f32) {
-    let w: Vec<f32> = FISH_TABLE
-        .iter()
-        .enumerate()
-        .map(|(i, f)| f.3 * (1.0 + luck * FISH_RARITY[i]).max(0.05))
-        .collect();
-    let total: f32 = w.iter().sum();
-    let mut r = rf(0.0, total);
-    for (i, f) in FISH_TABLE.iter().enumerate() {
-        if r < w[i] {
-            return (i, rf(f.1, f.2) * (1.0 + 0.25 * luck.max(0.0)));
-        }
-        r -= w[i];
-    }
-    (0, 0.15)
 }
 
 
@@ -2738,12 +2725,17 @@ async fn main() {
     game::run().await;
 }
 
+/// The random generator is global, so tests that depend on it must not run at the same time.
+#[cfg(test)]
+pub static RAND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod col_tests {
     use super::*;
 
     #[test]
     fn collide_hut_walls() {
+        let _g = RAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         rand::srand(20_261_010);
         let t = Terrain::gen();
         let mut pool: HashMap<(i32, i32), MB> = HashMap::new();

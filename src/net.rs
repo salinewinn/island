@@ -1,4 +1,4 @@
-//! Tiny TCP "room code" multiplayer for up to four players.
+﻿//! Tiny TCP "room code" multiplayer for up to four players.
 //!
 //! One player hosts and gets a room code that encodes their address, port and a random room id
 //! (a new one every time they host). Friends type the code in to join. The host relays everybody's
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub const PORT: u16 = 47321;
 pub const MAX_PLAYERS: usize = 4;
 /// Bump whenever the world or protocol changes: players must run the same build.
-pub const VERSION: u32 = 7;
+pub const VERSION: u32 = 8;
 
 const ALPHA: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Host-side id of a connection that hasn't finished the HELLO handshake yet.
@@ -145,6 +145,10 @@ pub struct PlayerNet {
     pub tier: u8,
     pub swim: bool,
     pub speed: f32,
+    /// this player's boat: position, heading and state (0 = none, 1 = moored, 2 = rowing, 3 = motoring)
+    pub boat: [f32; 3],
+    pub byaw: f32,
+    pub bstate: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +161,10 @@ pub enum NetEvent {
     Spawn { id: u32, p: [f32; 3], v: [f32; 3] },
     Msg(String),
     Welcome(u8),
+    /// a player's name changed / became known
+    Name(u8, String),
+    /// the shared money pool changed (new balance)
+    Coins(i32),
     /// another player's encoded character look (people::Look::encode)
     Look(u8, String),
     Disconnected(String),
@@ -226,6 +234,10 @@ pub struct Net {
     relay_ready: bool,
     join_relay_room: Option<String>,
     relay_code_cache: String,
+    /// our player name ("" = just "Player N")
+    my_name: String,
+    /// the money everybody shares; the host's number is the truth
+    pub balance: i32,
     removed: Vec<u32>,
     looks: [Option<String>; MAX_PLAYERS],
     my_look: Option<String>,
@@ -352,8 +364,8 @@ fn f(it: &mut std::str::SplitWhitespace) -> f32 {
 
 fn fmt_state(s: &PlayerNet) -> String {
     format!(
-        "S {} {:.2} {:.2} {:.2} {:.3} {:.3} {} {} {:.2} {:.2} {:.2} {} {} {:.2}\n",
-        s.id, s.pos[0], s.pos[1], s.pos[2], s.yaw, s.pitch, s.slot, s.fstate, s.lure[0], s.lure[1], s.lure[2], s.tier, s.swim as u8, s.speed
+        "S {} {:.2} {:.2} {:.2} {:.3} {:.3} {} {} {:.2} {:.2} {:.2} {} {} {:.2} {:.2} {:.2} {:.2} {:.3} {}\n",
+        s.id, s.pos[0], s.pos[1], s.pos[2], s.yaw, s.pitch, s.slot, s.fstate, s.lure[0], s.lure[1], s.lure[2], s.tier, s.swim as u8, s.speed, s.boat[0], s.boat[1], s.boat[2], s.byaw, s.bstate
     )
 }
 
@@ -369,7 +381,18 @@ fn parse_state(rest: &str) -> Option<PlayerNet> {
     let tier = f(&mut it) as u8;
     let swim = f(&mut it) > 0.5;
     let speed = f(&mut it);
-    Some(PlayerNet { id, pos, yaw, pitch, slot, fstate, lure, tier, swim, speed })
+    let boat = [f(&mut it), f(&mut it), f(&mut it)];
+    let byaw = f(&mut it);
+    let bstate = f(&mut it) as u8;
+    Some(PlayerNet { id, pos, yaw, pitch, slot, fstate, lure, tier, swim, speed, boat, byaw, bstate })
+}
+
+const MAX_COINS: i32 = 99_999_999;
+
+/// Player names are short and plain so they can't break the line protocol or the layout.
+pub fn clean_name(s: &str) -> String {
+    let t: String = s.chars().filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-' | '.')).take(16).collect();
+    t.trim().to_string()
 }
 
 /// A look code is digits and dots only, and short.
@@ -473,6 +496,8 @@ impl Net {
             relay_ready: false,
             join_relay_room: None,
             relay_code_cache: String::new(),
+            my_name: String::new(),
+            balance: 0,
             removed: vec![],
             looks: [None, None, None, None],
             my_look: None,
@@ -508,7 +533,7 @@ impl Net {
         self.mode = Mode::Host;
         self.my_id = 0;
         self.welcomed = true;
-        self.names = [Some("Player 1".into()), None, None, None];
+        self.names = [Some(if self.my_name.is_empty() { "Player 1".to_string() } else { self.my_name.clone() }), None, None, None];
         self.looks = [self.my_look.clone(), None, None, None];
         self.nonce = fresh_nonce(self.last_nonce);
         self.last_nonce = self.nonce;
@@ -741,6 +766,45 @@ impl Net {
         }
     }
 
+    /// Our player name (letters, digits, space, _ - . only; at most 16 characters).
+    pub fn set_name(&mut self, name: &str) {
+        self.my_name = clean_name(name);
+        match self.mode {
+            Mode::Host => {
+                let n = if self.my_name.is_empty() { "Player 1".to_string() } else { self.my_name.clone() };
+                self.names[0] = Some(n.clone());
+                self.broadcast(&format!("N 0 {n}\n"), None);
+            }
+            Mode::Client if self.welcomed && !self.my_name.is_empty() => {
+                let l = format!("NAME {}\n", self.my_name);
+                self.broadcast(&l, None);
+            }
+            _ => {}
+        }
+    }
+
+    /// Host: start (or reset) the shared money at this amount.
+    pub fn set_balance(&mut self, v: i32) {
+        self.balance = v.clamp(0, MAX_COINS);
+        if self.mode == Mode::Host {
+            self.broadcast(&format!("W {}\n", self.balance), None);
+        }
+    }
+
+    /// We earned (+) or spent (-) money: the shared pool changes for every player.
+    pub fn coin_delta(&mut self, d: i32) {
+        match self.mode {
+            Mode::Host => {
+                self.balance = (self.balance as i64 + d as i64).clamp(0, MAX_COINS as i64) as i32;
+                self.broadcast(&format!("W {}\n", self.balance), None);
+            }
+            Mode::Client if self.welcomed => {
+                self.broadcast(&format!("WD {d}\n"), None);
+            }
+            _ => {}
+        }
+    }
+
     pub fn send_msg(&mut self, text: &str) {
         if self.can_send() {
             let clean: String = text.chars().filter(|c| !c.is_control()).collect();
@@ -904,7 +968,7 @@ impl Net {
         self.peers[idx].id = id;
         self.names[id as usize] = Some(name.clone());
         self.looks[id as usize] = None;
-        let mut msg = format!("WELCOME {id}\n");
+        let mut msg = format!("WELCOME {id}\nW {}\n", self.balance);
         for (i, n) in self.names.iter().enumerate() {
             if let Some(n) = n {
                 if i as u8 != id {
@@ -978,6 +1042,30 @@ impl Net {
                     ev.push(NetEvent::Look(from, rest.to_string()));
                 }
             }
+            "NAME" => {
+                let mut name = clean_name(rest);
+                if name.is_empty() {
+                    name = format!("Player {}", from + 1);
+                }
+                // nobody else may use the same name
+                let base = name.clone();
+                let mut k = 2;
+                while self.names.iter().enumerate().any(|(i, n)| i != from as usize && n.as_deref() == Some(name.as_str())) {
+                    name = format!("{} {}", base.chars().take(13).collect::<String>(), k);
+                    k += 1;
+                }
+                self.names[from as usize] = Some(name.clone());
+                self.broadcast(&format!("N {from} {name}\n"), None);
+                ev.push(NetEvent::Name(from, name));
+            }
+            "WD" => {
+                if let Ok(d) = rest.parse::<i32>() {
+                    let d = d.clamp(-1_000_000, 1_000_000);
+                    self.balance = (self.balance as i64 + d as i64).clamp(0, MAX_COINS as i64) as i32;
+                    self.broadcast(&format!("W {}\n", self.balance), None);
+                    ev.push(NetEvent::Coins(self.balance));
+                }
+            }
             _ => {}
         }
     }
@@ -1009,6 +1097,10 @@ impl Net {
                         self.status = format!("Connected - you are Player {}", id + 1);
                         if let Some(l) = self.my_look.clone() {
                             self.broadcast(&format!("LOOK {l}\n"), None);
+                        }
+                        if !self.my_name.is_empty() {
+                            let l = format!("NAME {}\n", self.my_name);
+                            self.broadcast(&l, None);
                         }
                         ev.push(NetEvent::Welcome(id));
                     }
@@ -1061,6 +1153,22 @@ impl Net {
                 }
             }
             "MSG" => ev.push(NetEvent::Msg(rest.chars().take(MAX_MSG_CHARS).collect())),
+            "W" => {
+                if let Ok(v) = rest.parse::<i32>() {
+                    self.balance = v.clamp(0, MAX_COINS);
+                    ev.push(NetEvent::Coins(self.balance));
+                }
+            }
+            "N" => {
+                let (id, name) = rest.split_once(' ').unwrap_or((rest, ""));
+                if let Ok(id) = id.parse::<u8>() {
+                    let name = clean_name(name);
+                    if (id as usize) < MAX_PLAYERS && !name.is_empty() {
+                        self.names[id as usize] = Some(name.clone());
+                        ev.push(NetEvent::Name(id, name));
+                    }
+                }
+            }
             "LOOK" => {
                 let (id, code) = rest.split_once(' ').unwrap_or((rest, ""));
                 if let Ok(id) = id.parse::<u8>() {
@@ -1431,6 +1539,41 @@ mod tests {
         // leaving is noticed
         c1.n.leave();
         c2.n.leave();
+    }
+
+    #[test]
+    fn names_and_shared_coins() {
+        let _g = lock();
+        let mut hn = Net::new();
+        hn.use_upnp = false;
+        hn.use_tunnel = false;
+        hn.set_name("Captain");
+        hn.host().expect("host");
+        hn.set_balance(100);
+        let mut h = T { n: hn, ev: vec![] };
+        let code = code_for(&h.n);
+        let mut c1 = T::client(&code);
+        c1.n.set_name("Mia <b>!");
+        wait(all!(h, c1), "c1 welcome", |t| welcomed(t[1]));
+        wait(all!(h, c1), "names", |t| t[0].n.names[1].as_deref() == Some("Mia b") && t[1].n.names[0].as_deref() == Some("Captain"));
+        wait(all!(h, c1), "start balance", |t| t[1].has(|e| matches!(e, NetEvent::Coins(100))));
+        // a client spends: everybody's money drops
+        c1.n.coin_delta(-30);
+        wait(all!(h, c1), "spend", |t| t[0].has(|e| matches!(e, NetEvent::Coins(70))) && t[1].has(|e| matches!(e, NetEvent::Coins(70))));
+        // the host earns: everybody's money rises
+        h.n.coin_delta(50);
+        wait(all!(h, c1), "earn", |t| t[1].has(|e| matches!(e, NetEvent::Coins(120))) && t[0].n.balance == 120);
+        // can't go below zero
+        c1.n.coin_delta(-1_000_000);
+        wait(all!(h, c1), "floor", |t| t[1].has(|e| matches!(e, NetEvent::Coins(0))));
+        // a second player with the same name gets a different one; late joiners learn the others' names
+        let mut c2 = T::client(&code);
+        c2.n.set_name("Mia b");
+        wait(all!(h, c1, c2), "c2 welcome", |t| welcomed(t[2]));
+        wait(all!(h, c1, c2), "dup name", |t| t[0].n.names[2].as_deref() == Some("Mia b 2") && t[2].n.names[1].as_deref() == Some("Mia b") && t[1].n.names[2].as_deref() == Some("Mia b 2"));
+        // a name change shows up for everyone
+        c1.n.set_name("Zed");
+        wait(all!(h, c1, c2), "rename", |t| t[2].n.names[1].as_deref() == Some("Zed") && t[0].n.names[1].as_deref() == Some("Zed"));
     }
 
     #[test]

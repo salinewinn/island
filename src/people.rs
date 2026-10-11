@@ -26,7 +26,7 @@ pub fn draw_person_old(mb: &mut MB, feet: Vec3, yaw: f32, _o: &Outfit, phase: f3
         None => Look::marlo(),
         Some(s) => Look::default_for(s),
     };
-    let pose = Pose { yaw, phase, walk, item: slot.and_then(ItemKind::from_u8), tier, lure, lit: true, eye, time };
+    let pose = Pose { yaw, phase, walk, item: slot.and_then(ItemKind::from_u8), tier, lure, lit: true, eye, time, swim: false, surf: 0.0, sit: false, fish: None };
     draw_person(mb, feet, &look, &pose);
 }
 
@@ -249,6 +249,13 @@ pub struct Pose {
     pub lit: bool,
     pub eye: Vec3,
     pub time: f32,
+    /// swimming at the water surface (walk is then the stroke strength) and the water height there
+    pub swim: bool,
+    pub surf: f32,
+    /// sitting on a boat seat
+    pub sit: bool,
+    /// the fish in hand (species, kg), when item is a fish
+    pub fish: Option<(usize, f32)>,
 }
 
 // ===========================================================================
@@ -1423,7 +1430,7 @@ fn hat(mb: &mut MB, s: &Sk) {
 // Held items
 // ===========================================================================
 fn draw_rod(mb: &mut MB, base: Vec3, dir: Vec3, tier: u8, lure: Option<Vec3>, eye: Vec3, time: f32) {
-    let t = (tier as usize).min(2);
+    let t = (tier as usize).min(3);
     let col = vec3(RODS[t].6[0], RODS[t].6[1], RODS[t].6[2]);
     cyl(mb, base - dir * 0.04, base + dir * 0.32, 0.0225, 0.021, vec3(0.08, 0.08, 0.09), 8);
     cyl(mb, base + dir * 0.17, base + dir * 0.20, 0.026, 0.026, vec3(0.62, 0.64, 0.68), 8);
@@ -1457,11 +1464,15 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let fem = look.female;
     let k: f32 = if fem { 0.935 } else { 1.0 };
     let old = look.hair_color == 5 || look.hair_color == 6;
-    let walk = pose.walk.clamp(0.0, 1.0);
+    let swimming = pose.swim;
+    let sitting = pose.sit && !swimming;
+    let walk = if swimming || sitting { 0.0 } else { pose.walk.clamp(0.0, 1.0) };
+    let sw_amt = if swimming { 0.35 + 0.65 * pose.walk.clamp(0.0, 1.0) } else { 0.0 };
+    let lower = if sitting { 0.5 } else { 0.0 };
     let ph = pose.phase;
     let tm = pose.time;
     let breathe = (tm * 1.6).sin() * (1.0 - walk * 0.7);
-    let bob = 0.018 * walk * (2.0 * ph).cos() - 0.012 * walk;
+    let bob = 0.018 * walk * (2.0 * ph).cos() - 0.012 * walk - lower;
     let lat = -0.02 * walk * ph.cos() + 0.008 * (tm * 0.5).sin() * (1.0 - walk);
     let lean_x = 0.07 * walk;
     let tw_p = -0.10 * walk * ph.sin();
@@ -1486,9 +1497,24 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
         let d = ff * pitch.cos() + y * pitch.sin();
         let u = y * pitch.cos() - ff * pitch.sin();
         let a0 = if pitch < 0.0 { 0.14 } else { -0.05 };
-        let target = g0 + ff * a0 - d * a0 + u * 0.085;
+        let mut target = g0 + ff * a0 - d * a0 + u * 0.085;
         hip[i] = base + y * 0.955 + fpel.r * (s * 0.088);
-        let (kn, an) = ik2(hip[i], target, 0.445, 0.435, ff + fpel.r * s * 0.15);
+        let (mut d, mut u) = (d, u);
+        let mut pole = ff + fpel.r * s * 0.15;
+        if swimming {
+            // flutter kick: the legs trail behind and beat up and down (up/down once the body is laid flat)
+            let kick = (ph * 2.0 + i as f32 * PI).sin() * 0.15 * sw_amt;
+            target = hip[i] - y * 0.83 + fpel.f * kick + fpel.r * (s * 0.02);
+            pole = fpel.f + fpel.r * s * 0.1;
+            d = (-y * 0.85 + fpel.f * 0.3).normalize();
+            u = fpel.f;
+        } else if sitting {
+            target = hip[i] + fpel.f * 0.43 - y * 0.40 + fpel.r * (s * 0.03);
+            pole = y + fpel.r * s * 0.2;
+            d = fpel.f;
+            u = y;
+        }
+        let (kn, an) = ik2(hip[i], target, 0.445, 0.435, pole);
         knee[i] = kn;
         ank[i] = an;
         fd[i] = d;
@@ -1498,7 +1524,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let stoop = if old { 0.02 } else { 0.0 };
     let hyaw = pose.yaw + tw_c * 0.3 + (tm * 0.37).sin() * 0.25 * (1.0 - walk);
     let hf = vec3(hyaw.cos(), 0.0, hyaw.sin());
-    let pt: f32 = 0.05 + if old { 0.08 } else { 0.0 };
+    let pt: f32 = if swimming { -1.2 } else { 0.05 + if old { 0.08 } else { 0.0 } };
     let fh = hf * pt.cos() - y * pt.sin();
     let uh = y * pt.cos() + hf * pt.sin();
     let rh = vec3(-hyaw.sin(), 0.0, hyaw.cos());
@@ -1515,8 +1541,9 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     for i in 0..2 {
         sh[i] = fch.p(lean_x * 0.52, 1.425 + 0.004 * breathe, sd(i) * shx);
     }
-    let it = pose.item;
+    let it = if swimming { None } else { pose.item };
     let mut rod: Option<(Vec3, Vec3)> = None;
+    let mut fishp: Option<Vec3> = None;
     let mut coco: Option<Vec3> = None;
     let mut lant: Option<Vec3> = None;
     let mut tin: Option<Vec3> = None;
@@ -1557,14 +1584,47 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
             tg[0] = Some((tr, -y, fch.f, 1.0));
             bucket = Some(palm_of(tr, -y) - y * 0.17);
         }
+        Some(ItemKind::Fish) => {
+            let dg = (fch.f * 0.6 - y * 0.5).normalize();
+            let tr = sh[0] + fch.f * 0.24 - y * 0.40 - fch.r * 0.02;
+            tg[0] = Some((tr, dg, y, 0.9));
+            fishp = Some(palm_of(tr, dg));
+        }
         None => {}
+    }
+    let mut poles: [Option<Vec3>; 2] = [None, None];
+    if swimming {
+        // freestyle: pull under the body, lift out of the water, reach forward (up in this frame = the swimmer's head)
+        for i in 0..2 {
+            let s = sd(i);
+            let c = (ph * 0.9 + i as f32 * PI).rem_euclid(TAU);
+            let (reach, h, side_k);
+            if c < PI {
+                let q = c / PI;
+                let e = q * q * (3.0 - 2.0 * q);
+                reach = mixf(0.60, -0.12, e);
+                h = -0.17 - 0.10 * (PI * q).sin();
+                side_k = 0.06 + 0.06 * (PI * q).sin();
+                poles[i] = Some(fch.f * 0.5 + fch.r * s * 0.8);
+            } else {
+                let q = (c - PI) / PI;
+                let e = q * q * (3.0 - 2.0 * q);
+                reach = mixf(-0.12, 0.60, e);
+                h = 0.33 * (PI * q).sin() - 0.04;
+                side_k = 0.16 * (PI * q).sin() + 0.06;
+                poles[i] = Some(-fch.f * 0.9 + fch.r * s * 0.5);
+            }
+            let amp = 0.55 + 0.45 * sw_amt;
+            let t = sh[i] + y * (reach * amp + 0.05) - fch.f * (h * amp) + fch.r * (s * side_k);
+            tg[i] = Some((t, y, -fch.r * s, 0.2));
+        }
     }
     for i in 0..2 {
         let s = sd(i);
         let th = -s * 0.36 * ph.sin() * walk + (tm * 0.9 + s).sin() * 0.02 * (1.0 - walk);
         let r = 0.567 - 0.017 * (th.max(0.0) / 0.36);
         let hang = sh[i] + (fch.f * th.sin() - y * th.cos()) * r + fch.r * s * 0.045;
-        let pole = -fch.f * 0.5 - y * 0.3 + fch.r * s * 0.6;
+        let pole = poles[i].unwrap_or(-fch.f * 0.5 - y * 0.3 + fch.r * s * 0.6);
         if let Some((t, d, n, c)) = tg[i] {
             let (e, w) = ik2(sh[i], t, 0.30, 0.27, pole);
             el[i] = e;
@@ -1652,6 +1712,73 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     if let Some(p) = bucket {
         draw_bucket(mb, w(p), Vec3::Y);
     }
+    if let (Some(p), Some((sp, kg))) = (fishp, pose.fish) {
+        let len = crate::fish::fish_len(sp, kg).min(0.95);
+        let c = w(p) - Vec3::Y * (len * 0.42);
+        let fp = crate::fish::FishPose { heading: pose.yaw, pitch: 1.35, roll: 0.0, t: tm * 2.0, amp: 0.25, open: 0.3 };
+        crate::fish::draw_fish(mb, sp, c, len, &fp, true);
+    }
+    if swimming {
+        // lay the whole body flat on the water: tip it forward about the hips and float it at the surface
+        let pivot = feet + Vec3::Y * (0.95 * k);
+        let (sn, cs) = 1.5f32.sin_cos();
+        let lift = (pose.surf - 0.12) - pivot.y + (tm * 1.7).sin() * 0.015;
+        let rot = |v: Vec3| -> Vec3 {
+            let d = v - pivot;
+            let (a, b, c) = (d.dot(f0), d.y, d.dot(r0));
+            pivot + f0 * (a * cs + b * sn) + Vec3::Y * (b * cs - a * sn) + r0 * c
+        };
+        let start = if mb.v.len() >= v0 { v0 } else { 0 };
+        for v in mb.v[start..].iter_mut() {
+            v.position = rot(v.position) + Vec3::Y * lift;
+            let n = vec3(v.normal.x, v.normal.y, v.normal.z);
+            if n.length_squared() > 1e-8 {
+                let (a, b, c) = (n.dot(f0), n.y, n.dot(r0));
+                let nn = f0 * (a * cs + b * sn) + Vec3::Y * (b * cs - a * sn) + r0 * c;
+                v.normal = vec4(nn.x, nn.y, nn.z, v.normal.w);
+            }
+        }
+    }
+}
+
+/// Your own arms while swimming, seen from the camera: alternating freestyle strokes.
+/// `amt` (0..1) is how hard you are swimming.
+#[allow(clippy::too_many_arguments)]
+pub fn fp_swim_arms(mb: &mut MB, look: &Look, eye: Vec3, fwd: Vec3, right: Vec3, up: Vec3, phase: f32, amt: f32) {
+    mb.ensure(900, 2400);
+    let skin = v3(SKIN[(look.skin as usize).min(5)].1) * 0.94;
+    let sleeve = if look.top_style == 2 { skin } else { cl(look.sleeve_color) };
+    let a = 0.35 + 0.65 * amt;
+    for i in 0..2 {
+        let s = sd(i);
+        let c = (phase + i as f32 * PI).rem_euclid(TAU);
+        let (reach, h, side);
+        if c < PI {
+            let q = c / PI;
+            let e = q * q * (3.0 - 2.0 * q);
+            reach = mixf(0.62, 0.10, e);
+            h = -0.24 - 0.16 * (PI * q).sin();
+            side = 0.20 + 0.05 * (PI * q).sin();
+        } else {
+            let q = (c - PI) / PI;
+            let e = q * q * (3.0 - 2.0 * q);
+            reach = mixf(0.10, 0.62, e);
+            h = -0.20 + 0.42 * (PI * q).sin();
+            side = 0.22 + 0.16 * (PI * q).sin();
+        }
+        let shoulder = eye + right * (s * 0.26) - up * 0.30 - fwd * 0.02;
+        let hand = eye + fwd * (0.30 + (reach - 0.30) * a) + up * (-0.30 + (h + 0.30) * a) + right * (s * side);
+        let (elbow, wrist) = ik2(shoulder, hand, 0.30, 0.27, up * 0.8 + right * (s * 0.5));
+        cyl(mb, shoulder, elbow, 0.052, 0.046, sleeve, 8);
+        blob(mb, elbow, Vec3::splat(0.048), sleeve, 0.0, 6, 4, 0.0, shade);
+        cyl(mb, elbow, wrist, 0.043, 0.034, skin, 8);
+        let d = (wrist - elbow).normalize_or_zero();
+        blob(mb, wrist + d * 0.05, vec3(0.045, 0.030, 0.07), skin, 0.0, 7, 4, 0.0, shade);
+        for k in 0..4 {
+            let off = right * ((k as f32 - 1.5) * 0.013);
+            cyl(mb, wrist + d * 0.09 + off, wrist + d * 0.15 + off, 0.008, 0.006, skin, 4);
+        }
+    }
 }
 
 /// Rotating full-body preview for the character menu, drawn inside the pixel rectangle `rect = (x, y, w, h)`.
@@ -1666,7 +1793,7 @@ pub fn draw_preview(look: &Look, yaw: f32, time: f32, mat: &Material, rect: (f32
     let d = (2.1 * k * 0.5 / t).max(1.2 * 0.5 / (t * asp));
     let target = vec3(0.0, 0.98 * k, 0.0);
     let cam = target + vec3(0.0, 0.2, d);
-    let pose = Pose { yaw: PI * 0.5 + yaw, phase: 0.0, walk: 0.0, item: None, tier: 0, lure: None, lit: false, eye: cam, time };
+    let pose = Pose { yaw: PI * 0.5 + yaw, phase: 0.0, walk: 0.0, item: None, tier: 0, lure: None, lit: false, eye: cam, time, swim: false, surf: 0.0, sit: false, fish: None };
     let mut mb = MB::new();
     cyl(&mut mb, vec3(0.0, -0.03, 0.0), vec3(0.0, 0.0, 0.0), 0.6, 0.6, vec3(0.16, 0.19, 0.22), 28);
     draw_person(&mut mb, Vec3::ZERO, look, &pose);

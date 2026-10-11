@@ -1,7 +1,7 @@
 //! Procedural sound: every effect and ambience loop is synthesised at start-up into a 16-bit mono WAV
 //! buffer (no asset files) and played through macroquad's audio.
 
-use macroquad::audio::{load_sound_from_bytes, play_sound, set_sound_volume, PlaySoundParams, Sound};
+use macroquad::audio::{load_sound_from_bytes, play_sound, set_sound_volume, stop_sound, PlaySoundParams, Sound};
 use macroquad::prelude::Vec3;
 use std::cell::Cell;
 use std::f32::consts::{PI, TAU};
@@ -174,9 +174,20 @@ pub enum Snd {
     Land,
     Creak,
     Bird,
+    Thrash,
+    Tension,
+    Drag,
+    Key,
+    Paddle,
+    Motor,
+    Bloop,
+    Flop,
 }
 
-pub const ALL: [Snd; 26] = [
+/// Everything is played this much louder than the master slider says: the synthesised sounds are quiet.
+const LOUD: f32 = 1.9;
+
+pub const ALL: [Snd; 34] = [
     Snd::StepSand,
     Snd::StepGrass,
     Snd::StepWood,
@@ -203,12 +214,20 @@ pub const ALL: [Snd; 26] = [
     Snd::Land,
     Snd::Creak,
     Snd::Bird,
+    Snd::Thrash,
+    Snd::Tension,
+    Snd::Drag,
+    Snd::Key,
+    Snd::Paddle,
+    Snd::Motor,
+    Snd::Bloop,
+    Snd::Flop,
 ];
 
 fn variants(s: Snd) -> usize {
     match s {
         Snd::StepSand | Snd::StepGrass | Snd::StepWood | Snd::Creak | Snd::Bird => 3,
-        Snd::StepWater | Snd::Splash | Snd::Reel | Snd::Coins => 2,
+        Snd::StepWater | Snd::Splash | Snd::Reel | Snd::Coins | Snd::Thrash | Snd::Paddle | Snd::Flop => 2,
         _ => 1,
     }
 }
@@ -242,6 +261,14 @@ fn secs(s: Snd) -> f32 {
         Snd::Land => 0.22,
         Snd::Creak => 0.6,
         Snd::Bird => 0.5,
+        Snd::Thrash => 0.55,
+        Snd::Tension => 0.35,
+        Snd::Drag => 0.5,
+        Snd::Key => 1.2,
+        Snd::Paddle => 0.6,
+        Snd::Motor => 0.2,
+        Snd::Bloop => 3.2,
+        Snd::Flop => 0.3,
     }
 }
 
@@ -274,6 +301,14 @@ fn base_vol(s: Snd) -> f32 {
         Snd::Land => 0.6,
         Snd::Creak => 0.45,
         Snd::Bird => 0.35,
+        Snd::Thrash => 0.85,
+        Snd::Tension => 0.45,
+        Snd::Drag => 0.55,
+        Snd::Key => 0.8,
+        Snd::Paddle => 0.7,
+        Snd::Motor => 0.5,
+        Snd::Bloop => 0.9,
+        Snd::Flop => 0.8,
     }
 }
 
@@ -512,6 +547,100 @@ fn gen_oneshot(s: Snd, v: usize) -> Vec<f32> {
                 })
                 .collect()
         }
+        Snd::Thrash => {
+            let mut nz = noise(&mut r, n);
+            lp(&mut nz, 2600.0 - vf * 700.0);
+            let bub = bubbles(&mut r, d, 6);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    nz[i] * (t / 0.01).min(1.0) * (-t * 5.5).exp() * 1.3 + bub[i] * 0.5 + sweep(t, 150.0, 60.0, 14.0) * (-t * 10.0).exp() * 0.6
+                })
+                .collect()
+        }
+        Snd::Tension => {
+            // a taut line humming: a thin rising whine with a little grit
+            let nz = lp_of(&noise(&mut r, n), 7000.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    let p = t / d;
+                    let f = 520.0 + 380.0 * p + 18.0 * (TAU * 31.0 * t).sin();
+                    ((TAU * f * t).sin() + 0.35 * (TAU * f * 2.0 * t).sin()) * (PI * p).sin().powf(0.6) * 0.7 + nz[i] * 0.12 * (PI * p).sin()
+                })
+                .collect()
+        }
+        Snd::Drag => {
+            // reel drag: a fast ratchet that speeds up and a zipping tone
+            let mut o = vec![0.0; n];
+            let mut at = 0.0f32;
+            let mut gap = 0.045f32;
+            while at < d - 0.05 {
+                let c = render(0.012, |t| (TAU * 2400.0 * t).sin() * (-t * 300.0).exp() + r.n() * (-t * 500.0).exp() * 0.6);
+                mix(&mut o, at, &c, 1.0);
+                at += gap;
+                gap = (gap * 0.93).max(0.012);
+            }
+            o
+        }
+        Snd::Key => {
+            let mut o = vec![0.0; n];
+            for (k, f) in [1760.0f32, 2349.0, 2960.0].iter().enumerate() {
+                mix(&mut o, 0.08 * k as f32, &render(0.7, |t| bell(t, *f, 4.0)), 0.9 - 0.15 * k as f32);
+            }
+            let nz = lp_of(&noise(&mut r, n_of(0.25)), 6000.0);
+            let rattle: Vec<f32> = nz.iter().enumerate().map(|(i, x)| x * (-(i as f32 / RATE as f32) * 18.0).exp() * (0.5 + 0.5 * (i as f32 * 0.02).sin().abs())).collect();
+            mix(&mut o, 0.0, &rattle, 0.5);
+            o
+        }
+        Snd::Paddle => {
+            // a wooden knock then the blade through water
+            let mut nz = noise(&mut r, n);
+            lp(&mut nz, 1500.0 + vf * 400.0);
+            let bub = bubbles(&mut r, d, 3);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    let p = t / d;
+                    (TAU * (170.0 + vf * 20.0) * t).sin() * (-t * 40.0).exp() * 0.8 + nz[i] * (PI * p).sin().powi(2) * 1.1 + bub[i] * 0.35
+                })
+                .collect()
+        }
+        Snd::Motor => {
+            // one chug of an old outboard
+            let nz = lp_of(&noise(&mut r, n), 900.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    let saw = ((t * 62.0).fract() * 2.0 - 1.0) + 0.5 * ((t * 124.0).fract() * 2.0 - 1.0);
+                    (saw * 0.5 + nz[i] * 0.6) * (t / 0.006).min(1.0) * (-t * 20.0).exp()
+                })
+                .collect()
+        }
+        Snd::Bloop => {
+            let tone = |t: f32| -> f32 {
+                if t < 0.0 {
+                    return 0.0;
+                }
+                let phase = TAU * (45.0 * t + 105.0 * (1.0 - (-t * 3.2).exp()) / 3.2);
+                ((phase).sin() + 0.25 * (phase * 2.0).sin()) * (t / 0.04).min(1.0) * (-t * 2.4).exp()
+            };
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    tone(t) * 0.8 + tone(t - 0.55) * 0.3 + tone(t - 1.1) * 0.12
+                })
+                .collect()
+        }
+        Snd::Flop => {
+            let nz = lp_of(&noise(&mut r, n), 1800.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    nz[i] * (t / 0.004).min(1.0) * (-t * 22.0).exp() * 1.2 + sweep(t, 260.0 - vf * 40.0, 110.0, 25.0) * (-t * 18.0).exp() * 0.6
+                })
+                .collect()
+        }
         Snd::Bird => match v {
             // three rising chirps
             0 => {
@@ -560,8 +689,9 @@ pub enum Amb {
     Fire,
     Crickets,
     Under,
+    Music,
 }
-const AMBS: [Amb; 5] = [Amb::Waves, Amb::Wind, Amb::Fire, Amb::Crickets, Amb::Under];
+const AMBS: [Amb; 6] = [Amb::Waves, Amb::Wind, Amb::Fire, Amb::Crickets, Amb::Under, Amb::Music];
 
 pub fn loop_secs(a: Amb) -> f32 {
     match a {
@@ -570,6 +700,7 @@ pub fn loop_secs(a: Amb) -> f32 {
         Amb::Fire => 4.0,
         Amb::Crickets => 4.0,
         Amb::Under => 4.0,
+        Amb::Music => 16.0,
     }
 }
 
@@ -641,6 +772,37 @@ fn gen_loop(a: Amb) -> Vec<f32> {
                         mix(&mut o, start + p as f32 * 0.04, &pulse, amp);
                     }
                     start += period;
+                }
+            }
+            o
+        }
+        Amb::Music => {
+            // a calm, slow loop: soft pads under a gently plucked arpeggio (Am - F - C - G)
+            let total = loop_secs(a);
+            let mut o = vec![0.0f32; n];
+            let chords: [[f32; 3]; 4] = [[220.0, 261.63, 329.63], [174.61, 220.0, 261.63], [196.0, 261.63, 329.63], [196.0, 246.94, 293.66]];
+            let wrap = |o: &mut Vec<f32>, at: f32, src: &[f32], gain: f32| {
+                let len = o.len();
+                let s0 = n_of(at.rem_euclid(total));
+                for (i, s) in src.iter().enumerate() {
+                    o[(s0 + i) % len] += s * gain;
+                }
+            };
+            for (ci, ch) in chords.iter().enumerate() {
+                let start = ci as f32 * 4.0;
+                for f in ch.iter() {
+                    for det in [-1.0f32, 1.0] {
+                        let fr = f * 0.5 * (1.0 + det * 0.0025);
+                        let pad = render(5.0, |t| ((TAU * fr * t).sin() + 0.28 * (TAU * fr * 2.0 * t).sin()) * (PI * t / 5.0).sin().powi(2));
+                        wrap(&mut o, start - 0.5, &pad, 0.07);
+                    }
+                }
+                let order = [0usize, 1, 2, 1, 2, 1, 0, 1];
+                for (j, &oi) in order.iter().enumerate() {
+                    let f = ch[oi] * if j % 4 == 2 { 2.0 } else { 1.0 } * if j % 4 == 0 { 1.0 } else { 2.0 } * 0.5;
+                    let at = start + j as f32 * 0.5;
+                    let pl = render(1.4, |t| ((TAU * f * t).sin() + 0.3 * (TAU * f * 2.0 * t).sin() * (-t * 6.0).exp()) * (t / 0.004).min(1.0) * (-t * 3.2).exp());
+                    wrap(&mut o, at, &pl, if j % 2 == 0 { 0.10 } else { 0.06 });
                 }
             }
             o
@@ -718,7 +880,7 @@ pub struct AmbCtx<'a> {
 pub struct Sfx {
     bank: Vec<Vec<Sound>>,
     loops: Vec<Option<Sound>>,
-    vols: [f32; 5],
+    vols: [f32; 6],
     master: f32,
     rng: Cell<u32>,
     probe_t: f32,
@@ -730,6 +892,15 @@ pub struct Sfx {
     was_swim: bool,
     creak_t: f32,
     bird_t: f32,
+}
+
+impl Drop for Sfx {
+    /// leaving the world (back to the main menu) must silence its ambience
+    fn drop(&mut self) {
+        for s in self.loops.iter().flatten() {
+            stop_sound(s);
+        }
+    }
 }
 
 impl Sfx {
@@ -756,7 +927,7 @@ impl Sfx {
         Sfx {
             bank,
             loops,
-            vols: [0.0; 5],
+            vols: [0.0; 6],
             master: 0.7,
             rng: Cell::new(0x1234_5679),
             probe_t: 0.0,
@@ -782,7 +953,7 @@ impl Sfx {
 
     /// Play a one-shot (a random variant) at `scale` x its base level x master volume.
     pub fn play(&self, which: Snd, scale: f32) {
-        let v = self.master * base_vol(which) * scale;
+        let v = self.master * base_vol(which) * scale * LOUD;
         if v < 0.002 {
             return;
         }
@@ -843,7 +1014,8 @@ impl Sfx {
         let night = (1.0 - c.day_f).clamp(0.0, 1.0).powf(1.5);
         let inland = ((self.water_d - 12.0) / 25.0).clamp(0.0, 1.0);
         let crick = 0.4 * night * inland;
-        let mut t = [waves * 0.55, wind * 0.32, fire * 0.7, crick, 0.0];
+        let music = if c.under { 0.0 } else { 0.30 - 0.10 * night };
+        let mut t = [waves * 0.55, wind * 0.32, fire * 0.7, crick, 0.0, music];
         if c.under {
             for x in t.iter_mut() {
                 *x *= 0.12;
@@ -851,10 +1023,10 @@ impl Sfx {
             t[4] = 0.65;
         }
         let k = (dt * 4.0).min(1.0);
-        for i in 0..5 {
+        for i in 0..6 {
             self.vols[i] += (t[i] - self.vols[i]) * k;
             if let Some(s) = &self.loops[i] {
-                set_sound_volume(s, (self.vols[i] * self.master).clamp(0.0, 1.0));
+                set_sound_volume(s, (self.vols[i] * self.master * LOUD).clamp(0.0, 1.0));
             }
         }
 
@@ -943,7 +1115,7 @@ mod tests {
                 let b = gen_oneshot(s, v);
                 check(&format!("{:?}/{}", s, v), &b);
                 assert_eq!(b.len(), n_of(secs(s)), "{:?} length", s);
-                assert!(b.len() > 500 && b.len() < n_of(2.5), "{:?} duration", s);
+                assert!(b.len() > 500 && b.len() < n_of(3.5), "{:?} duration", s);
                 // fades make the edges silent
                 assert!(b[0].abs() < 0.05 && b[b.len() - 1].abs() < 0.05, "{:?} edges", s);
                 // wav size

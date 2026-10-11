@@ -5,15 +5,137 @@ use super::*;
 // ---------------------------------------------------------------------------
 // Fishing data
 // ---------------------------------------------------------------------------
-/// (name, cast range x, reel speed x, luck, bite-time x, price, blank colour, wrap colour)
-pub const RODS: [(&str, f32, f32, f32, f32, i32, [f32; 3], [f32; 3]); 3] = [
-    ("Starter Rod", 1.0, 1.0, 0.0, 1.0, 0, [0.11, 0.33, 0.33], [0.85, 0.15, 0.12]),
-    ("Fiberglass Rod", 1.25, 1.35, 0.25, 0.85, 120, [0.15, 0.40, 0.18], [0.95, 0.85, 0.25]),
-    ("Carbon Pro Rod", 1.5, 1.8, 0.55, 0.7, 400, [0.06, 0.06, 0.09], [0.95, 0.30, 0.10]),
+pub const N_RODS: usize = 4;
+pub const N_BAITS: usize = 5;
+
+/// (name, cast range x, reel speed x, luck, bite-time x, price, blank colour, wrap colour, line strength)
+pub const RODS: [(&str, f32, f32, f32, f32, i32, [f32; 3], [f32; 3], f32); N_RODS] = [
+    ("Starter Rod", 1.0, 1.0, 0.0, 1.0, 0, [0.11, 0.33, 0.33], [0.85, 0.15, 0.12], 1.0),
+    ("Fiberglass Rod", 1.25, 1.35, 0.25, 0.85, 120, [0.15, 0.40, 0.18], [0.95, 0.85, 0.25], 1.8),
+    ("Carbon Pro Rod", 1.5, 1.8, 0.55, 0.7, 400, [0.06, 0.06, 0.09], [0.95, 0.30, 0.10], 3.5),
+    ("Titan Rod", 1.8, 2.3, 0.9, 0.6, 1500, [0.50, 0.53, 0.60], [0.15, 0.80, 0.95], 6.5),
 ];
 
 /// (name, luck, bite-time x, pack price, pack size)
-pub const BAITS: [(&str, f32, f32, i32, u32); 3] = [("Worm", 0.10, 0.95, 10, 10), ("Shrimp", 0.30, 0.75, 60, 10), ("Lucky Lure", 0.65, 0.55, 150, 5)];
+pub const BAITS: [(&str, f32, f32, i32, u32); N_BAITS] = [
+    ("Worm", 0.10, 0.95, 10, 10),
+    ("Shrimp", 0.30, 0.75, 60, 10),
+    ("Squid Strip", 0.50, 0.65, 110, 8),
+    ("Lucky Lure", 0.65, 0.55, 150, 5),
+    ("Abyss Glow Lure", 1.10, 0.50, 420, 3),
+];
+
+/// Gear upgrades: (name, description, price)
+pub const UPGRADES: [(&str, &str, i32); 3] = [
+    ("Braided Line", "Stronger line: +25% before it snaps", 180),
+    ("Steel Leader", "Heavy-duty leader: +60% line strength", 650),
+    ("Pro Reel", "Smooth drag: +25% reeling power", 420),
+];
+
+/// Everything about one fish fight. Drive it with `fight_step`.
+#[derive(Clone, Copy)]
+pub struct Fight {
+    /// 0 = the fish is at the far end of the line, 1 = landed
+    pub prog: f32,
+    pub tension: f32,
+    pub stamina: f32,
+    pub fish: usize,
+    pub kg: f32,
+    pub t: f32,
+    /// how hard the fish is thrashing right now (0..1)
+    pub thrash: f32,
+    pub thr_left: f32,
+    pub next: f32,
+    pub overload: f32,
+    pub target: Vec3,
+    pub q: f32,
+    pub dir: f32,
+}
+
+impl Fight {
+    pub fn new(fish: usize, kg: f32, target: Vec3, q: f32) -> Fight {
+        Fight { prog: 0.3, tension: 0.15, stamina: 1.0, fish, kg, t: 0.0, thrash: 0.0, thr_left: 0.0, next: rf(0.8, 1.6), overload: 0.0, target, q, dir: 1.0 }
+    }
+    /// how heavy it feels: grows with the square root of its weight
+    pub fn heavy(&self) -> f32 {
+        self.kg.max(0.05).sqrt()
+    }
+}
+
+pub struct FightIn {
+    /// how hard you are reeling right now (mouse pulled back), ~0..4 per second
+    pub pull: f32,
+    /// the rod and reel's reeling power
+    pub reel: f32,
+    /// how much force the line takes before it snaps
+    pub cap: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FightOut {
+    Going,
+    Landed,
+    Snapped,
+    Escaped,
+}
+
+/// One step of the fight. Heavier fish are harder to pull in, pull back harder and thrash harder;
+/// reeling during a thrash makes the line tension spike (too much for too long snaps it).
+pub fn fight_step(f: &mut Fight, inp: &FightIn, dt: f32) -> FightOut {
+    let sp = &crate::fish::SPECIES[f.fish];
+    let heavy = f.heavy();
+    let force = sp.fight * heavy;
+    let ratio = force / inp.cap.max(0.1);
+    f.t += dt;
+    // thrash schedule
+    if f.thr_left > 0.0 {
+        f.thr_left -= dt;
+        if f.thr_left <= 0.0 {
+            f.thrash = 0.0;
+            f.next = rf(1.0, 2.6) / (0.7 + 0.3 * sp.fight) * (0.7 + 0.6 * f.stamina);
+        }
+    } else {
+        f.next -= dt;
+        if f.next <= 0.0 {
+            f.thr_left = rf(0.55, 1.15);
+            f.thrash = rf(0.65, 1.0) * (0.4 + 0.6 * f.stamina);
+            f.dir = if rf(0.0, 1.0) < 0.5 { -1.0 } else { 1.0 };
+        }
+    }
+    let pull = inp.pull.max(0.0);
+    // line tension
+    let base = 0.10 + 0.10 * ratio.min(1.5);
+    let pull_load = pull * 0.16 * (0.55 + ratio * 0.9);
+    let thr_load = f.thrash * (0.30 + 0.55 * ratio.min(2.5));
+    let target_t = (base + pull_load + thr_load).min(1.7);
+    f.tension += (target_t - f.tension) * (dt * 7.0).min(1.0);
+    if f.tension > 1.0 {
+        f.overload += dt * (f.tension - 0.9) * 4.0;
+    } else {
+        f.overload = (f.overload - dt * 1.5).max(0.0);
+    }
+    if f.overload > 0.35 {
+        return FightOut::Snapped;
+    }
+    // the fish tires when it is kept under steady tension
+    if f.tension > 0.3 && pull > 0.4 {
+        f.stamina = (f.stamina - dt * 0.17 / (1.0 + 0.25 * heavy)).max(0.0);
+    } else if f.tension < 0.2 {
+        f.stamina = (f.stamina + dt * 0.015).min(1.0);
+    }
+    // line gained / lost: bigger fish take much more effort per pull
+    let eff = inp.reel / (1.0 + heavy * 0.20 * (1.0 - 0.45 * (1.0 - f.stamina)));
+    let gain = pull * 0.22 * eff * (1.0 + 0.3 * f.q) * dt;
+    let drag = (0.045 + 0.0010 * force.min(120.0)) * (0.30 + 0.70 * f.stamina) * (1.0 + 1.1 * f.thrash) * dt;
+    f.prog = (f.prog + gain - drag).min(1.0);
+    if f.prog >= 1.0 {
+        FightOut::Landed
+    } else if f.prog <= 0.0 {
+        FightOut::Escaped
+    } else {
+        FightOut::Going
+    }
+}
 
 #[derive(Clone, Copy)]
 pub enum FS {
@@ -22,18 +144,19 @@ pub enum FS {
     Flying { u: f32, target: Vec3, q: f32 },
     Waiting { t: f32, bite_at: f32, target: Vec3, q: f32 },
     Bite { t: f32, target: Vec3, q: f32 },
-    Reeling { prog: f32, target: Vec3, q: f32, fish: usize, kg: f32, t: f32 },
-    Show { t: f32, fish: usize, kg: f32 },
+    Reeling(Fight),
+    /// the catch is in your hands: press a free hotbar number to keep it, or release it
+    Holding { t: f32, fish: usize, kg: f32 },
 }
 
 impl FS {
     pub fn code(&self) -> u8 {
         match self {
-            FS::Idle | FS::Show { .. } => 0,
+            FS::Idle | FS::Holding { .. } => 0,
             FS::Charging { .. } => 1,
             FS::Flying { .. } | FS::Waiting { .. } => 2,
             FS::Bite { .. } => 3,
-            FS::Reeling { .. } => 4,
+            FS::Reeling(_) => 4,
         }
     }
 }
@@ -203,7 +326,10 @@ pub enum ItemKind {
     Coconut = 1,
     Lantern = 2,
     Bait = 3,
+    /// no longer sold (fish are carried in the hotbar now); only kept so old saves still load
     Bucket = 4,
+    /// a caught fish; which one is stored next to the hotbar slot
+    Fish = 5,
 }
 
 impl ItemKind {
@@ -214,8 +340,100 @@ impl ItemKind {
             2 => Some(ItemKind::Lantern),
             3 => Some(ItemKind::Bait),
             4 => Some(ItemKind::Bucket),
+            5 => Some(ItemKind::Fish),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod fight_tests {
+    use super::*;
+
+    /// A steady reeler who eases off while the fish thrashes. Returns the outcome and the time taken.
+    fn play(fish: usize, kg: f32, rod: usize, line_mult: f32, reel_mult: f32, patient: bool) -> (FightOut, f32) {
+        rand::srand(1234 + fish as u64 * 7 + kg as u64);
+        let mut f = Fight::new(fish, kg, Vec3::ZERO, 0.8);
+        let cap = 10.0 * RODS[rod].8 * line_mult;
+        let reel = RODS[rod].2 * reel_mult;
+        let dt = 1.0 / 60.0;
+        let mut t = 0.0;
+        loop {
+            let base_pull = if f.stamina < 0.5 { 1.9 } else { 1.3 };
+            let pull = if patient && f.thrash > 0.2 { 0.0 } else if patient && f.tension > 0.78 { 0.5 } else { base_pull };
+            let out = fight_step(&mut f, &FightIn { pull, reel, cap }, dt);
+            t += dt;
+            if out != FightOut::Going {
+                return (out, t);
+            }
+            if t > 400.0 {
+                return (FightOut::Escaped, t);
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_table() {
+        let _g = crate::RAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let rods = [(0usize, 1.0f32, 1.0f32), (1, 1.0, 1.0), (2, 1.25, 1.0), (3, 2.0, 1.25)];
+        for (fish, kg) in [(0usize, 0.15f32), (1, 0.9), (2, 2.2), (3, 6.0), (4, 18.0), (7, 8.0), (8, 30.0), (9, 70.0), (10, 60.0), (11, 110.0), (12, 350.0), (13, 520.0)] {
+            let mut row = format!("{:16} {:6.1}kg ", crate::fish::SPECIES[fish].name, kg);
+            for (rod, lm, rm) in rods {
+                let (mut landed, mut snapped, mut esc, mut tsum) = (0, 0, 0, 0.0f32);
+                for s in 0..12u64 {
+                    rand::srand(77 + s * 13 + fish as u64);
+                    let (o, t) = play(fish, kg, rod, lm, rm, true);
+                    match o {
+                        FightOut::Landed => {
+                            landed += 1;
+                            tsum += t;
+                        }
+                        FightOut::Snapped => snapped += 1,
+                        _ => esc += 1,
+                    }
+                }
+                row += &format!(" | rod{} L{:2} S{:2} E{:2} {:4.0}s", rod, landed, snapped, esc, if landed > 0 { tsum / landed as f32 } else { 0.0 });
+            }
+            println!("{row}");
+        }
+    }
+
+    #[test]
+    fn fights_are_fair_and_scale_with_size() {
+        let _g = crate::RAND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // small fish are easy with the starter rod
+        for (fish, kg) in [(0usize, 0.15f32), (1, 0.9), (2, 2.2)] {
+            let (o, t) = play(fish, kg, 0, 1.0, 1.0, true);
+            assert_eq!(o, FightOut::Landed, "fish {fish} should be easy, took {t}");
+            assert!(t < 30.0, "fish {fish} took {t}s");
+        }
+        // bigger fish take longer
+        let (_, t_small) = play(1, 0.9, 0, 1.0, 1.0, true);
+        let (_, t_big) = play(8, 30.0, 0, 1.0, 1.0, true);
+        assert!(t_big > t_small * 1.5, "{t_big} vs {t_small}");
+        // a deep-water monster beats everything short of the best gear...
+        for rod in 0..3 {
+            let (o, _) = play(12, 350.0, rod, 1.0, 1.0, true);
+            assert_ne!(o, FightOut::Landed, "rod {rod}");
+        }
+        // ...but the best rod with every upgrade lands it, after a real fight
+        let (o, t) = play(12, 350.0, 3, 2.0, 1.25, true);
+        assert_eq!(o, FightOut::Landed, "took {t}");
+        assert!((15.0..150.0).contains(&t), "took {t}");
+        // yanking the reel through every thrash snaps the line; easing off lands the fish
+        let (mut snaps, mut landed_patient) = (0, 0);
+        for s in 0..12u64 {
+            rand::srand(900 + s);
+            if play(8, 30.0, 0, 1.0, 1.0, false).0 == FightOut::Snapped {
+                snaps += 1;
+            }
+            rand::srand(900 + s);
+            if play(8, 30.0, 0, 1.0, 1.0, true).0 == FightOut::Landed {
+                landed_patient += 1;
+            }
+        }
+        assert!(snaps >= 8, "only {snaps} snaps");
+        assert!(landed_patient >= 10, "only {landed_patient} landed");
     }
 }
 

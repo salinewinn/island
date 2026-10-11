@@ -607,7 +607,7 @@ pub async fn run() {
     let mut tent_msg = String::new();
     let mut dusk_hint = false;
     let mut next_local_cid: u32 = 0;
-    let marlo_look = Look::marlo();
+    let _marlo_look = Look::marlo();
     let mut remote_looks: [Look; 4] = [Look::default_for(0), Look::default_for(1), Look::default_for(2), Look::default_for(3)];
 
     // ---- menus / network ----
@@ -644,7 +644,7 @@ pub async fn run() {
     let mut net_clock: Option<(f32, f32)> = None;
     let mut send_t = 0.0f32;
     let mut time_t = 0.0f32;
-    let mut npc_yaw = npc_yaw0;
+    let _ = npc_yaw0;
     let mut fps_smooth = 60.0f32;
     let mut sleep: Option<(f32, f32)> = None; // (elapsed, target cycle time)
     let mut intro: Option<f32> = if !continuing && !has_arg("--skipmenu") { Some(0.0) } else { None };
@@ -1419,24 +1419,6 @@ pub async fn run() {
         if plaza.fire_pos.distance(eye) < 160.0 {
             draw_campfire_flames(&mut dynmb, plaza.fire_pos + Vec3::Y * 0.1, time);
         }
-        // shopkeeper
-        {
-            let to = vec2(feet.x - npc_pos.x, feet.z - npc_pos.z);
-            if to.length() < 9.0 {
-                npc_yaw = lerp_angle(npc_yaw, to.y.atan2(to.x), dt * 3.0);
-            } else {
-                npc_yaw = lerp_angle(npc_yaw, npc_yaw0, dt * 2.0);
-            }
-            if npc_pos.distance(eye) < 80.0 {
-                let sway = (time * 0.9).sin() * 0.04;
-                draw_person(
-                    &mut dynmb,
-                    npc_pos,
-                    &marlo_look,
-                    &Pose { yaw: npc_yaw + sway, phase: 0.0, walk: 0.0, item: None, tier: 0, lure: None, lit: false, eye, time },
-                );
-            }
-        }
         // other players
         for (i, r) in remotes.iter().enumerate() {
             if let Some(r) = r {
@@ -1568,13 +1550,6 @@ pub async fn run() {
                     }
                 }
             }
-            if let Some(p) = world_to_screen(&cam, eye, fwd, npc_pos + Vec3::Y * 2.0) {
-                if npc_pos.distance(eye) < 25.0 {
-                    let label = "Hermit";
-                    let tw = measure_text(label, None, (22.0 * hs) as u16, 1.0).width;
-                    shadow_text(label, p.x - tw * 0.5, p.y, 22.0 * hs, Color::new(1.0, 0.9, 0.6, 1.0));
-                }
-            }
             // top-right: clock and money
             if st.show_clock {
                 let hh = sky.clock.floor() as i32;
@@ -1615,7 +1590,7 @@ pub async fn run() {
             if screen == Screen::None && sleep.is_none() {
                 let ikey = bind_label(st.bind(Act::Interact));
                 let prompt = if npc_target {
-                    Some(format!("[{}] Talk to the Hermit", ikey))
+                    Some(format!("[{}] Trade at the counter", ikey))
                 } else if tent_target {
                     Some(format!("[{}] Rest at the tent", ikey))
                 } else if coco_target.is_some() {
@@ -1920,7 +1895,7 @@ pub async fn run() {
                 let (px, py, pw, ph) = (190.0f32, 36.0f32, 900.0f32, 648.0f32);
                 ui.rect(px, py, pw, ph, COL_PANEL);
                 ui.outline(px, py, pw, ph, 2.0, Color::new(1.0, 0.9, 0.6, 0.35));
-                ui.text("The Hermit's Trades", px + 24.0, py + 14.0, 34.0, Color::new(1.0, 0.9, 0.6, 1.0));
+                ui.text("Trading Counter", px + 24.0, py + 14.0, 34.0, Color::new(1.0, 0.9, 0.6, 1.0));
                 let ctext = format!("Coins: {}", coins);
                 let cw = ui.text_w(&ctext, 28.0);
                 ui.text(&ctext, px + pw - 24.0 - cw, py + 18.0, 28.0, Color::new(0.5, 0.95, 0.5, 1.0));

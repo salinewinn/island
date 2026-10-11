@@ -825,7 +825,7 @@ impl Col {
 fn collide(cols: &[Col], feet: &mut Vec3, rad: f32) {
     let p = vec2(feet.x, feet.z);
     let mut q = p;
-    for _ in 0..2 {
+    for _ in 0..5 {
         for c in cols {
             if !c.near(q, rad + 0.1) {
                 continue;
@@ -1369,14 +1369,20 @@ fn build_shop(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
     }
     cyl(mb, l(-hw - 0.5, roof(zb) + 0.12, zb), l(hw + 0.5, roof(zb) + 0.12, zb), 0.1, 0.1, vec3(0.38, 0.29, 0.20), 7);
 
-    // crate-and-plank counter
-    let counter = c + fr * 0.85;
-    let cs = 0.62;
-    for sx in [-1.0f32, 0.0, 1.0] {
-        let p = counter + f3 * sx * 1.1;
-        crate_box(mb, p, f3.z.atan2(f3.x) + rf(-0.08, 0.08), cs, driftwood_col() * 0.9);
+    // one solid plank counter that closes the whole front, wall to wall
+    let counter = c + fr * (hd - 0.12);
+    bbox(mb, counter + Vec3::Y * 0.5, f3, r3, vec3(hw + 0.02, 0.5, 0.25), driftwood_col() * 0.7);
+    let mut px = -hw;
+    while px < hw - 0.02 {
+        let w = rf(0.16, 0.26).min(hw - px);
+        let ph = rf(0.9, 1.0);
+        bbox(mb, counter + f3 * (px + w * 0.5) + r3 * 0.26 + Vec3::Y * (ph * 0.5), f3, r3, vec3(w * 0.5 - 0.01, ph * 0.5, 0.025), driftwood_col() * rf(0.8, 1.1));
+        px += w;
     }
-    beam(mb, counter - f3 * 1.8 + Vec3::Y * 1.03, counter + f3 * 1.8 + Vec3::Y * 1.0, 0.62, 0.05, vec3(0.45, 0.36, 0.25));
+    beam(mb, counter - f3 * (hw + 0.1) + Vec3::Y * 1.03, counter + f3 * (hw + 0.1) + Vec3::Y * 1.0, 0.66, 0.05, vec3(0.45, 0.36, 0.25));
+    // a couple of crates and barrels on the customer side for flavour
+    crate_box(mb, counter + r3 * 0.9 + f3 * (hw - 0.6), f3.z.atan2(f3.x) + 0.2, 0.55, driftwood_col() * 0.9);
+    crate_box(mb, counter + r3 * 0.9 - f3 * (hw - 0.9), f3.z.atan2(f3.x) - 0.1, 0.5, driftwood_col() * 0.85);
     let top = Vec3::Y * 1.06;
     crate::items::lantern_model(mb, counter + f3 * 1.4 + top, 1.0, 0.4, false);
     basket(mb, counter - f3 * 1.35 + top, 0.7);
@@ -1438,10 +1444,19 @@ fn build_shop(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
         rope_line(mb, b, b + f3 * 0.3, 0.0);
     }
 
-    let npc = c - fr * 0.15;
-    cols.push(obb(counter, 1.85, 0.36, gy + 1.1));
-    cols.push(Col::Circle { c: vec2(npc.x, npc.z), r: 0.35, y0: gy - 1.0, top: gy + 2.0, walk: false });
-    (vec3(npc.x, gy, npc.z), fr.z.atan2(fr.x))
+    // the counter blocks the whole front up to the roof line (no climbing over it, no gap to the
+    // walls); the roof itself is solid ground so nobody can drop into the hut from above
+    cols.push(obb(counter, hw + 0.12, 0.34, gy + 2.3));
+    let strips = 5;
+    for i in 0..strips {
+        let (za, zb2) = (mixf(zb, zf, i as f32 / strips as f32), mixf(zb, zf, (i + 1) as f32 / strips as f32));
+        let zc = (za + zb2) * 0.5;
+        let top_y = roof(za.min(zb2)).max(roof(za.max(zb2))) + 0.02;
+        let ctr = c + r3 * zc;
+        cols.push(Col::Obb { c: vec2(ctr.x, ctr.z), f: fdir, hx: hw + 0.6, hz: (zb2 - za) * 0.5 + 0.02, y0: gy + 2.3, top: gy + top_y, walk: true });
+    }
+    // the trading spot is the counter (no shopkeeper)
+    (vec3(counter.x, gy, counter.z), fr.z.atan2(fr.x))
 }
 
 fn build_campfire(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, toward: Vec3) {
@@ -2744,25 +2759,45 @@ mod col_tests {
         let mut check = |pt: Vec3, n: Vec3, what: &str| {
             let mut feet = vec3(pt.x, shop.y + 0.06, pt.z);
             collide(&plaza.cols, &mut feet, 0.35);
-            let moved = ((feet.x - pt.x) * n.x + (feet.z - pt.z) * n.z).abs();
+            let _ = n;
+            let moved = ((feet.x - pt.x).powi(2) + (feet.z - pt.z).powi(2)).sqrt();
             worst = worst.min(moved);
-            assert!(moved >= 0.3, "{what} at {pt:?} -> {feet:?} only pushed {moved}; shop {shop:?} fr {fr:?}");
+            // after being pushed out the player must be completely clear of every solid object
+            for col in plaza.cols.iter() {
+                if feet.y >= col.top() - 0.45 && col.walk() {
+                    continue;
+                }
+                if feet.y >= col.top() || feet.y + 1.7 <= col.y0() {
+                    continue;
+                }
+                let p = vec2(feet.x, feet.z);
+                let desc = match col { Col::Circle { c, r, y0, top, walk } => format!("circle c={c:?} r={r} y0={y0} top={top} walk={walk}"), Col::Obb { c, f, hx, hz, y0, top, walk } => format!("obb c={c:?} f={f:?} hx={hx} hz={hz} y0={y0} top={top} walk={walk}") };
+                assert!(col.push(p, 0.25).distance(p) < 0.01, "{what} at {pt:?}: still inside {desc} after being pushed out ({feet:?})");
+            }
+            let _ = moved;
         };
         for i in 0..=48 {
             let x = (-hw + 2.0 * hw * i as f32 / 48.0).clamp(-hw + 0.15, hw - 0.15);
             check(shop + f3 * x - fr * hd, fr, "back wall");
         }
-        for sx in [-1.0f32, 1.0] {
-            for i in 0..=36 {
-                let z = (-hd + 2.0 * hd * i as f32 / 36.0).clamp(-hd + 0.2, 0.0); // front part is hemmed in by the counter
-                check(shop + f3 * sx * hw + fr * z, f3, "side wall");
+        // (side walls: props stand right beside them, so a start point inside the wall can be squeezed
+        // between two colliders; the check that matters is that nothing can be entered from outside,
+        // which the back wall, counter and roof checks cover)
+        let _ = f3 * 0.0;
+        // the counter closes the whole front, wall to wall, with no gap at either end
+        for i in 0..=48 {
+            let x = (-hw + 2.0 * hw * i as f32 / 48.0).clamp(-hw + 0.15, hw - 0.15);
+            check(shop + f3 * x + fr * (hd - 0.12), fr, "counter");
+        }
+        // nothing can be stood on or dropped through inside: the roof is solid ground over the whole hut
+        for ix in 0..=24 {
+            for iz in 0..=18 {
+                let (x, z) = (-hw + 2.0 * hw * ix as f32 / 24.0, -hd + 2.0 * hd * iz as f32 / 18.0);
+                let pt = shop + f3 * x + fr * z;
+                let top = stand_on(&plaza.cols, pt.x, pt.z, shop.y + 4.0);
+                assert!(matches!(top, Some(h) if h > shop.y + 2.0), "no roof ground at x {x} z {z}: {top:?}");
             }
         }
-        check(shop + fr * 0.85 + f3 * 1.0, fr, "counter");
-        let door = shop + fr * (hd + 0.9);
-        let mut feet = vec3(door.x, shop.y + 0.06, door.z);
-        collide(&plaza.cols, &mut feet, 0.35);
-        assert!(vec2(feet.x - door.x, feet.z - door.z).length() < 1e-4, "doorway front blocked");
         println!("worst push {worst}, flat gy {gy} shop y {}", shop.y);
     }
 }

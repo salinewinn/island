@@ -900,7 +900,7 @@ fn rock_on(mb: &mut MB, t: &Terrain, p: Vec3, size: f32, dark: bool) -> (f32, f3
             mb.i.extend_from_slice(&[a, cc, b, b, cc, d]);
         }
     }
-    (rr * 0.85, cy0 + r.y * 0.95)
+    (rr * 1.05, cy0 + r.y * 0.95)
 }
 
 fn driftwood(mb: &mut MB, p: Vec3) {
@@ -1295,7 +1295,7 @@ fn build_shop(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
         bbox(mb, l(x + w * 0.5, h * 0.5, zz), f3, r3, vec3(w * 0.5 - 0.01, h * 0.5, 0.03), col);
         x += w;
     }
-    cols.push(obb(c - fr * hd, hw, 0.1, gy + 2.3));
+    cols.push(obb(c - fr * hd, hw + 0.12, 0.12, gy + 2.3));
     for sx in [-1.0f32, 1.0] {
         let mut z = -hd;
         while z < hd - 0.1 {
@@ -1306,7 +1306,7 @@ fn build_shop(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
             bbox(mb, l(sx * hw + rf(-0.02, 0.02), h * 0.5, zc), f3, r3, vec3(0.03, h * 0.5, w * 0.5 - 0.01), col);
             z += w;
         }
-        cols.push(obb(c + f3 * sx * hw, 0.1, hd, gy + 2.3));
+        cols.push(obb(c + f3 * sx * hw, 0.12, hd + 0.1, gy + 2.3));
         for y in [0.45f32, 1.3] {
             beam(mb, l(sx * hw + sx * 0.05, y, -hd), l(sx * hw + sx * 0.05, y + 0.05, hd), 0.09, 0.03, vec3(0.30, 0.23, 0.16));
         }
@@ -1438,7 +1438,7 @@ fn build_shop(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
     }
 
     let npc = c - fr * 0.15;
-    cols.push(obb(counter, 1.8, 0.3, gy + 1.05));
+    cols.push(obb(counter, 1.85, 0.36, gy + 1.1));
     cols.push(Col::Circle { c: vec2(npc.x, npc.z), r: 0.35, y0: gy - 1.0, top: gy + 2.0, walk: false });
     (vec3(npc.x, gy, npc.z), fr.z.atan2(fr.x))
 }
@@ -1467,7 +1467,7 @@ fn build_campfire(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Ve
     }
     cyl(mb, top, top - Vec3::Y * 0.5, 0.008, 0.008, vec3(0.15, 0.13, 0.12), 3);
     cyl(mb, top - Vec3::Y * 0.78, top - Vec3::Y * 0.52, 0.14, 0.16, vec3(0.16, 0.15, 0.15), 8);
-    cols.push(Col::Circle { c: vec2(c.x, c.z), r: 0.85, y0: c.y - 1.0, top: c.y + 0.5, walk: false });
+    cols.push(Col::Circle { c: vec2(c.x, c.z), r: 1.0, y0: c.y - 1.0, top: c.y + 1.6, walk: false });
     // two log seats
     let side = vec3(-toward.z, 0.0, toward.x);
     for sg in [-1.0f32, 1.0] {
@@ -1523,7 +1523,7 @@ fn build_tent(pool: &mut HashMap<(i32, i32), MB>, cols: &mut Vec<Col>, c: Vec3, 
         cyl(mb, stake2, stake2 + Vec3::Y * 0.25, 0.025, 0.02, vec3(0.42, 0.34, 0.25), 4);
         cyl(mb, rb0, stake2 + Vec3::Y * 0.2, 0.01, 0.01, vec3(0.65, 0.55, 0.38), 3);
     }
-    cols.push(Col::Obb { c: vec2(c.x, c.z), f: vec2(f3.x, f3.z), hx: hw + 0.05, hz: hd + 0.05, y0: c.y - 1.0, top: c.y + hh, walk: false });
+    cols.push(Col::Obb { c: vec2(c.x, c.z), f: vec2(f3.x, f3.z), hx: hw + 0.08, hz: hd + 0.08, y0: c.y - 1.0, top: c.y + hh, walk: false });
 }
 
 fn build_plaza(pool: &mut HashMap<(i32, i32), MB>, t: &Terrain) -> Plaza {
@@ -1546,17 +1546,22 @@ fn build_plaza(pool: &mut HashMap<(i32, i32), MB>, t: &Terrain) -> Plaza {
         let mb = pmb(pool, p);
         barrel(mb, p, 0.85, vec3(0.42, 0.31, 0.20));
         barrel(mb, p + sf3 * 0.7 + sfr * 0.3, 0.8, vec3(0.36, 0.30, 0.24));
-        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 0.9, y0: gy - 1.0, top: gy + 0.85, walk: false });
+        let p2 = p + sf3 * 0.7 + sfr * 0.3;
+        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 0.34, y0: gy - 1.0, top: gy + 0.85, walk: false });
+        cols.push(Col::Circle { c: vec2(p2.x, p2.z), r: 0.34, y0: gy - 1.0, top: gy + 0.8, walk: false });
         let q = shop - sf3 * 3.4 + sfr * 0.5;
         let mb = pmb(pool, q);
         crate_box(mb, q, rf(0.0, TAU), 0.7, vec3(0.50, 0.40, 0.28));
         crate_box(mb, q + Vec3::Y * 0.7 + sf3 * 0.05, rf(0.0, TAU), 0.55, vec3(0.44, 0.36, 0.26));
         crate_box(mb, q + sfr * 1.0 + sf3 * 0.4, rf(0.0, TAU), 0.5, vec3(0.38, 0.32, 0.25));
-        cols.push(Col::Circle { c: vec2(q.x, q.z), r: 0.75, y0: gy - 1.0, top: gy + 1.2, walk: false });
+        let q3 = q + sfr * 1.0 + sf3 * 0.4;
+        cols.push(Col::Circle { c: vec2(q.x, q.z), r: 0.5, y0: gy - 1.0, top: gy + 1.3, walk: false });
+        cols.push(Col::Circle { c: vec2(q3.x, q3.z), r: 0.38, y0: gy - 1.0, top: gy + 0.55, walk: false });
         let rp = shop + sfr * 2.6 - sf3 * 1.6;
         rope_coil(pmb(pool, rp), rp);
         let bp = shop + sfr * 2.4 + sf3 * 2.0;
         basket(pmb(pool, bp), bp, 1.0);
+        cols.push(Col::Circle { c: vec2(bp.x, bp.z), r: 0.27, y0: gy - 1.0, top: gy + 0.3, walk: false });
     }
     // washed-ashore cargo, driftwood and a fish rack where there is room
     {
@@ -1564,7 +1569,9 @@ fn build_plaza(pool: &mut HashMap<(i32, i32), MB>, t: &Terrain) -> Plaza {
         let mb = pmb(pool, p);
         barrel(mb, p, 0.8, vec3(0.34, 0.28, 0.22));
         crate_box(mb, p + vec3(0.9, 0.0, 0.3), rf(0.0, TAU), 0.6, vec3(0.46, 0.38, 0.27));
-        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 1.0, y0: gy - 1.0, top: gy + 0.8, walk: false });
+        let cr = p + vec3(0.9, 0.0, 0.3);
+        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 0.34, y0: gy - 1.0, top: gy + 0.8, walk: false });
+        cols.push(Col::Circle { c: vec2(cr.x, cr.z), r: 0.44, y0: gy - 1.0, top: gy + 0.6, walk: false });
         let p = at(50.0, 10.0);
         let mb = pmb(pool, p);
         for i in 0..3 {
@@ -1572,11 +1579,11 @@ fn build_plaza(pool: &mut HashMap<(i32, i32), MB>, t: &Terrain) -> Plaza {
             let d = vec3(a.cos(), 0.0, a.sin());
             cyl(mb, p - d * 1.1 + Vec3::Y * (0.12 + 0.1 * i as f32), p + d * 1.1 + Vec3::Y * (0.14 + 0.1 * i as f32), 0.13, 0.1, driftwood_col(), 7);
         }
-        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 1.0, y0: gy - 1.0, top: gy + 0.5, walk: false });
+        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 1.15, y0: gy - 1.0, top: gy + 0.5, walk: false });
         let p = at(110.0, 9.5);
         let d = dir_to(p, center);
         fish_rack(pmb(pool, p), p, vec3(-d.z, 0.0, d.x));
-        cols.push(Col::Circle { c: vec2(p.x, p.z), r: 0.5, y0: gy - 1.0, top: gy + 1.6, walk: false });
+        cols.push(Col::Obb { c: vec2(p.x, p.z), f: vec2(-d.z, d.x), hx: 1.08, hz: 0.14, y0: gy - 1.0, top: gy + 1.6, walk: false });
         for ang in [20.0f32, 80.0, 150.0] {
             let p = at(ang, rf(7.0, 11.0));
             for _ in 0..3 {
@@ -1595,7 +1602,7 @@ fn build_plaza(pool: &mut HashMap<(i32, i32), MB>, t: &Terrain) -> Plaza {
         let tside = vec3(-tfr.z, 0.0, tfr.x);
         let p = tent + tside * 3.4 + tfr * 1.0;
         firewood(pmb(pool, p), p, tfr);
-        cols.push(Col::Obb { c: vec2(p.x, p.z), f: vec2(tfr.x, tfr.z), hx: 0.65, hz: 0.55, y0: gy - 1.0, top: gy + 0.5, walk: false });
+        cols.push(Col::Obb { c: vec2(p.x, p.z), f: vec2(tfr.x, tfr.z), hx: 0.72, hz: 0.5, y0: gy - 1.0, top: gy + 0.5, walk: false });
         let q = tent - tside * 3.2 + tfr * 1.4;
         rope_coil(pmb(pool, q), q);
     }
@@ -2712,4 +2719,49 @@ fn window_conf() -> macroquad::conf::Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     game::run().await;
+}
+
+#[cfg(test)]
+mod col_tests {
+    use super::*;
+
+    #[test]
+    fn collide_hut_walls() {
+        rand::srand(20_261_010);
+        let t = Terrain::gen();
+        let mut pool: HashMap<(i32, i32), MB> = HashMap::new();
+        let plaza = build_plaza(&mut pool, &t);
+        let c2 = vec2(PLAZA_C.0, PLAZA_C.1);
+        let gy = t.at(c2.x, c2.y);
+        let center = vec3(c2.x, gy, c2.y);
+        let p = polar(c2, 290.0, 9.4);
+        let shop = vec3(p.x, t.at(p.x, p.y), p.y);
+        let fr = dir_to(shop, center);
+        let f3 = vec3(-fr.z, 0.0, fr.x);
+        let (hw, hd) = (2.4f32, 1.8f32);
+        let mut worst = 9.0f32;
+        let mut check = |pt: Vec3, n: Vec3, what: &str| {
+            let mut feet = vec3(pt.x, shop.y + 0.06, pt.z);
+            collide(&plaza.cols, &mut feet, 0.35);
+            let moved = ((feet.x - pt.x) * n.x + (feet.z - pt.z) * n.z).abs();
+            worst = worst.min(moved);
+            assert!(moved >= 0.3, "{what} at {pt:?} -> {feet:?} only pushed {moved}; shop {shop:?} fr {fr:?}");
+        };
+        for i in 0..=48 {
+            let x = (-hw + 2.0 * hw * i as f32 / 48.0).clamp(-hw + 0.15, hw - 0.15);
+            check(shop + f3 * x - fr * hd, fr, "back wall");
+        }
+        for sx in [-1.0f32, 1.0] {
+            for i in 0..=36 {
+                let z = (-hd + 2.0 * hd * i as f32 / 36.0).clamp(-hd + 0.2, 0.0); // front part is hemmed in by the counter
+                check(shop + f3 * sx * hw + fr * z, f3, "side wall");
+            }
+        }
+        check(shop + fr * 0.85 + f3 * 1.0, fr, "counter");
+        let door = shop + fr * (hd + 0.9);
+        let mut feet = vec3(door.x, shop.y + 0.06, door.z);
+        collide(&plaza.cols, &mut feet, 0.35);
+        assert!(vec2(feet.x - door.x, feet.z - door.z).length() < 1e-4, "doorway front blocked");
+        println!("worst push {worst}, flat gy {gy} shop y {}", shop.y);
+    }
 }

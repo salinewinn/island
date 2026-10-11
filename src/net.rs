@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub const PORT: u16 = 47321;
 pub const MAX_PLAYERS: usize = 4;
 /// Bump whenever the world or protocol changes: players must run the same build.
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 const ALPHA: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Host-side id of a connection that hasn't finished the HELLO handshake yet.
@@ -110,6 +110,7 @@ pub struct Net {
     join_nonce: u16,
     join_ver: u32,
     welcomed: bool,
+    late_events: Vec<NetEvent>,
     removed: Vec<u32>,
     looks: [Option<String>; MAX_PLAYERS],
     my_look: Option<String>,
@@ -348,6 +349,7 @@ impl Net {
             join_nonce: 0,
             join_ver: VERSION,
             welcomed: false,
+            late_events: vec![],
             removed: vec![],
             looks: [None, None, None, None],
             my_look: None,
@@ -643,7 +645,8 @@ impl Net {
                     }
                     Err(e) => {
                         self.mode = Mode::Off;
-                        self.status = e;
+                        self.status = e.clone();
+                        self.late_events.push(NetEvent::Disconnected(e));
                     }
                 }
             }
@@ -871,7 +874,7 @@ impl Net {
 
     /// Call every frame: accepts connections, reads/writes sockets, returns what happened.
     pub fn poll(&mut self) -> Vec<NetEvent> {
-        let mut ev = vec![];
+        let mut ev = std::mem::take(&mut self.late_events);
         let now = Instant::now();
         self.poll_background();
         self.poll_connect(now);

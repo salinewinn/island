@@ -97,7 +97,7 @@ fn v3(a: [f32; 3]) -> Vec3 {
 fn cl(i: u8) -> Vec3 {
     let c = v3(CLOTH[(i as usize).min(CLOTH.len() - 1)].1);
     let g = (c.x + c.y + c.z) / 3.0;
-    (c * 0.86 + Vec3::splat(g) * 0.14) * 0.97
+    (c * 0.86 + Vec3::splat(g) * 0.14) * (0.97 - 0.17 * smooth(0.5, 0.88, g))
 }
 
 /// Everything about a character's appearance that the player can customize.
@@ -581,6 +581,8 @@ struct Sk {
     fem: bool,
     old: bool,
     lk: Look,
+    lean: f32,
+    br: f32,
     skin: Vec3,
     hair: Vec3,
     eye: Vec3,
@@ -612,11 +614,15 @@ struct Sk {
     rh: Vec3,
 }
 
+fn lx(s: &Sk, y: f32) -> f32 {
+    s.lean * (y - 0.9).max(0.0)
+}
 fn t_ring(s: &Sk, y: f32, grow: f32, col: Vec3) -> R {
     let t = tbl(s.tt, y);
     let tw = mixf(s.tw_p, s.tw_c, smooth(0.95, 1.35, y));
     let fr = frame(s.feet + Vec3::Y * s.bob, s.yaw + tw);
-    R { c: fr.p(t[3], y, 0.0), u: fr.r, v: fr.f, ru: t[1] + grow, rv: t[2] + grow, col }
+    let g = grow + s.br * 0.003 * smooth(1.1, 1.35, y) * (1.0 - smooth(1.42, 1.5, y));
+    R { c: fr.p(t[3] + lx(s, y), y, 0.0), u: fr.r, v: fr.f, ru: t[1] + g, rv: t[2] + g, col }
 }
 fn hp(s: &Sk, x: f32, y: f32, z: f32) -> Vec3 {
     s.hc + s.fh * x + s.uh * y + s.rh * z
@@ -661,7 +667,7 @@ fn torso(mb: &mut MB, s: &Sk) {
     loft(mb, &rings, &Lf::c(16).caps(true, true), &id_s, &|i, th, c| {
         let y = TY[i];
         let c = tint(c, 0.4 * smooth(1.40, 1.46, y) * gs(angdiff(th, PI * 0.5), 1.2));
-        c * (1.0 - 0.07 * smooth(1.48, 1.512, y)) * (0.97 + 0.05 * hs(i as f32, th * 2.0))
+        c * (1.0 - 0.07 * smooth(1.48, 1.512, y)) * (0.985 + 0.015 * (th * 2.0 + i as f32 * 0.5).sin())
     });
 }
 
@@ -719,7 +725,7 @@ fn shirt(mb: &mut MB, s: &Sk) {
                     c *= 0.9 + 0.1 * smooth(hem, hem + 0.06, y);
                 }
                 3 => {
-                    c *= 0.95 + 0.07 * hs(i as f32, th * 3.0);
+                    c *= 0.97 + 0.04 * (th * 3.0 + i as f32).sin();
                     if y > 1.40 {
                         let hw = 0.55 * smooth(1.40, 1.512, y);
                         let m = (1.0 - smooth(hw - 0.12, hw + 0.02, angdiff(th, PI * 0.5))) * smooth(1.40, 1.44, y);
@@ -731,7 +737,7 @@ fn shirt(mb: &mut MB, s: &Sk) {
                     c *= mixf(0.82, 1.0, smooth(hem, hem + 0.12, y));
                 }
                 _ => {
-                    c *= 0.97 + 0.04 * hs(i as f32, th * 2.0);
+                    c *= 0.985 + 0.02 * (th * 2.0 + i as f32 * 0.7).sin();
                 }
             }
             c * mixf(0.88, 1.0, smooth(hem, hem + 0.05, y))
@@ -748,9 +754,9 @@ fn shirt(mb: &mut MB, s: &Sk) {
         let (a, b, c) = if style == 3 { (0.084, 0.078, 0.07) } else { (0.083, 0.071, 0.066) };
         let col = ccol;
         let rs = vec![
-            R { c: fr.p(-0.006, 1.50, 0.0), u: fr.r, v: fr.f, ru: a, rv: a * 0.94, col },
-            R { c: fr.p(-0.006, 1.52, 0.0), u: fr.r, v: fr.f, ru: b, rv: b * 0.96, col },
-            R { c: fr.p(-0.006, if style == 3 { 1.54 } else { 1.545 }, 0.0), u: fr.r, v: fr.f, ru: c, rv: c * 0.96, col: col * 0.92 },
+            R { c: fr.p(-0.006 + lx(s, 1.5), 1.50, 0.0), u: fr.r, v: fr.f, ru: a, rv: a * 0.94, col },
+            R { c: fr.p(-0.006 + lx(s, 1.5), 1.52, 0.0), u: fr.r, v: fr.f, ru: b, rv: b * 0.96, col },
+            R { c: fr.p(-0.006 + lx(s, 1.5), if style == 3 { 1.54 } else { 1.545 }, 0.0), u: fr.r, v: fr.f, ru: c, rv: c * 0.96, col: col * 0.92 },
         ];
         loft(mb, &rs, &Lf::c(18), &id_s, &|i, th, c| {
             if style == 3 && angdiff(th, PI * 0.5) < 0.6 && i > 0 {
@@ -773,7 +779,7 @@ fn shirt(mb: &mut MB, s: &Sk) {
         for e in [-1.0f32, 1.0] {
             let pts: Vec<Vec3> = [(0.100, 1.40, 0.072), (0.100, 1.45, 0.082), (0.078, 1.488, 0.088), (0.04, 1.502, 0.088), (-0.04, 1.502, 0.088), (-0.078, 1.488, 0.088), (-0.100, 1.45, 0.080), (-0.098, 1.41, 0.070)]
                 .iter()
-                .map(|&(x, y, z)| fr.p(x * if fem { 0.92 } else { 1.0 }, y, z * e * if fem { 0.88 } else { 1.0 }))
+                .map(|&(x, y, z)| fr.p(lx(s, 1.45) + x * if fem { 0.92 } else { 1.0 }, y, z * e * if fem { 0.88 } else { 1.0 }))
                 .collect();
             let rad = vec![(0.0045, 0.0125); 8];
             let c0 = body * 1.04;
@@ -789,7 +795,7 @@ fn pants(mb: &mut MB, s: &Sk) {
     ys.push(top);
     let bc = s.bc;
     let rings: Vec<R> = ys.iter().map(|&y| t_ring(s, y, 0.006, bc)).collect();
-    loft(mb, &rings, &Lf::c(16).caps(true, true), &id_s, &|i, th, c| c * (0.95 + 0.06 * hs(i as f32, th)) * if i + 1 == ys.len() { 0.82 } else { 1.0 });
+    loft(mb, &rings, &Lf::c(16).caps(true, true), &id_s, &|i, th, c| c * (0.975 + 0.03 * (th + i as f32).sin()) * if i + 1 == ys.len() { 0.82 } else { 1.0 });
     // belt for cropped tops
     if s.lk.top_style == 2 {
         let rs: Vec<R> = [1.02f32, 1.052].iter().map(|&y| t_ring(s, y, 0.012, vec3(0.20, 0.13, 0.08))).collect();
@@ -819,7 +825,7 @@ fn pants(mb: &mut MB, s: &Sk) {
         };
         if let Some(t0) = t0 {
             let ts = ts_between(t0, 1.0);
-            let rs = limb(h, k, a, &ts, s.fpel.r, &|t| rad(t), &|t| tint(s.skin * (0.98 + 0.04 * hs(t * 10.0, sdv)), 0.8 * gs(t - 0.5, 0.06) + 0.3 * gs(t - 0.9, 0.05)));
+            let rs = limb(h, k, a, &ts, s.fpel.r, &|t| rad(t), &|t| tint(s.skin * (0.99 + 0.015 * (t * 7.0 + sdv).sin()), 0.8 * gs(t - 0.5, 0.06) + 0.3 * gs(t - 0.9, 0.05)));
             loft(mb, &rs, &Lf::c(12), &id_s, &id_c);
         }
         let (tend, g, fl) = match st {
@@ -837,7 +843,7 @@ fn pants(mb: &mut MB, s: &Sk) {
             let e = g + fl * smooth(0.85, 1.05, t);
             (u + e, v + e)
         }, &|t| {
-            let mut c = bc * (0.96 + 0.05 * hs(t * 20.0, sdv));
+            let mut c = bc * (0.985 + 0.02 * (t * 9.0 + sdv).sin());
             if st == 1 {
                 c *= 1.0 + 0.10 * gs(t - 0.28, 0.1) + 0.06 * gs(t - 0.52, 0.05);
             }
@@ -858,6 +864,13 @@ fn pants(mb: &mut MB, s: &Sk) {
             }
         }
         loft(mb, &rs, &Lf::c(12).caps(false, tend < 0.95), &id_s, &id_c);
+        {
+            let r0_ = rad(0.0);
+            blob(mb, h, Vec3::splat(r0_.0 + 0.012), bc * 0.98, 0.0, 8, 5, s.yaw, shade);
+            let rk = rad(0.5);
+            let (kc, kr) = if tend > 0.55 { (bc, rk.0 + g + 0.002) } else { (s.skin, rk.0 + 0.002) };
+            blob(mb, k, Vec3::splat(kr), kc, 0.0, 8, 5, s.yaw, shade);
+        }
         if st == 0 {
             // cargo pocket on the outer thigh
             let c = pt3(h, k, a, 0.24) + s.fpel.r * sdv * (0.086 * lw + 0.022);
@@ -974,16 +987,16 @@ fn hand(mb: &mut MB, w: Vec3, d: Vec3, nh: Vec3, side: f32, curl: f32, skin: Vec
         .collect();
     loft(mb, &rs, &Lf::c(8).caps(false, true), &id_s, &id_c);
     let lens = [0.072f32, 0.080, 0.074, 0.060];
-    let offs = [0.029f32, 0.010, -0.010, -0.028];
+    let offs = [0.031f32, 0.0105, -0.0105, -0.030];
     for f in 0..4 {
         let c = curl * (1.0 + 0.08 * f as f32);
         let angs = [c * 1.1, c * 2.1, c * 2.7];
         let mut p = w + d * 0.088 + t * offs[f];
-        let mut rr = vec![ring(p, d * angs[0].cos() + n * angs[0].sin(), t, 0.0089, 0.0085, knuckle)];
+        let mut rr = vec![ring(p, d * angs[0].cos() + n * angs[0].sin(), t, 0.0082, 0.0080, knuckle)];
         for k in 0..3 {
             let dir = d * angs[k].cos() + n * angs[k].sin();
             p += dir * lens[f] / 3.0 * if k == 0 { 1.15 } else { 0.95 };
-            let r = 0.0089 * (1.0 - 0.13 * (k + 1) as f32);
+            let r = 0.0082 * (1.0 - 0.14 * (k + 1) as f32);
             rr.push(ring(p, dir, t, r, r * 0.95, skin));
         }
         loft(mb, &rr, &Lf::c(6).caps(false, true), &id_s, &id_c);
@@ -1002,7 +1015,8 @@ fn hand(mb: &mut MB, w: Vec3, d: Vec3, nh: Vec3, side: f32, curl: f32, skin: Vec
 }
 
 fn arm(mb: &mut MB, s: &Sk, i: usize) {
-    let (sh, el, wr) = (s.sh[i], s.el[i], s.wr[i]);
+    let (sh0, el, wr) = (s.sh[i], s.el[i], s.wr[i]);
+    let sh = sh0 - s.fch.r * sd(i) * 0.035 + Vec3::Y * 0.006;
     let lw = if s.fem { 0.88 } else { 1.0 };
     let style = s.lk.top_style;
     let (send, grow) = match style {
@@ -1018,7 +1032,7 @@ fn arm(mb: &mut MB, s: &Sk, i: usize) {
     let hint = s.fch.r;
     if send < 0.97 {
         let ts = ts_between(if send > 0.0 { send - 0.04 } else { 0.0 }, 1.0);
-        let rs = limb(sh, el, wr, &ts, hint, &rad, &|t| tint(s.skin * (0.98 + 0.04 * hs(t * 9.0, 2.0)), 0.5 * gs(t - 0.5, 0.06) + 0.4 * gs(t - 1.0, 0.1)));
+        let rs = limb(sh, el, wr, &ts, hint, &rad, &|t| tint(s.skin * (0.99 + 0.015 * (t * 6.0).sin()), 0.5 * gs(t - 0.5, 0.06) + 0.4 * gs(t - 1.0, 0.1)));
         loft(mb, &rs, &Lf::c(10).caps(send <= 0.0, false), &id_s, &id_c);
     }
     let sleeve_col = match style {
@@ -1030,7 +1044,7 @@ fn arm(mb: &mut MB, s: &Sk, i: usize) {
         let mut rs = limb(sh, el, wr, &ts, hint, &|t| {
             let (u, v) = rad(t);
             (u + grow, v + grow)
-        }, &|t| sleeve_col * (0.97 + 0.05 * hs(t * 14.0, 5.0)));
+        }, &|t| sleeve_col * (0.985 + 0.02 * (t * 8.0).sin()));
         let last = *rs.last().unwrap();
         let mut cuff = last;
         cuff.ru += 0.005;
@@ -1043,7 +1057,13 @@ fn arm(mb: &mut MB, s: &Sk, i: usize) {
         loft(mb, &rs, &Lf::c(10).caps(true, false), &id_s, &|i, th, c| if style == 3 { c * (0.92 + 0.08 * ((th * 5.0 + i as f32).sin())) } else { c });
     }
     let bc = if send > 0.0 { sleeve_col } else { s.skin };
-    blob(mb, sh + Vec3::Y * 0.004, vec3(0.063, 0.066, 0.063), bc, 0.0, 8, 5, s.yaw, shade);
+    let sr = 0.066 * lw.max(0.92) + if send > 0.0 { grow } else { 0.0 };
+    blob(mb, sh0 + Vec3::Y * 0.004, vec3(sr * 1.05, sr, sr), bc, 0.0, 10, 6, s.yaw, shade);
+    blob(mb, sh0 - s.fch.r * sd(i) * 0.03 + Vec3::Y * 0.012, vec3(sr * 0.95, sr * 0.9, sr * 0.95), bc, 0.0, 8, 5, s.yaw, shade);
+    {
+        let er = rad(0.5).0 + 0.002 + if send > 0.55 { grow } else { 0.0 };
+        blob(mb, el, Vec3::splat(er), if send > 0.55 { sleeve_col } else { s.skin }, 0.0, 8, 5, s.yaw, shade);
+    }
     hand(mb, wr, s.hd[i], s.hn[i], sd(i), s.curl[i], s.skin);
 }
 
@@ -1054,7 +1074,7 @@ fn face(mb: &mut MB, s: &Sk) {
     let nk = s.fh * 0.0;
     let _ = nk;
     // neck
-    let n0 = s.fch.p(0.0, 1.455, 0.0);
+    let n0 = s.fch.p(lx(s, 1.455), 1.455, 0.0);
     let n1 = hp(s, -0.012, -0.09, 0.0);
     let nr = if fem { 0.043 } else { 0.053 };
     let pts = [n0, n0.lerp(n1, 0.33), n0.lerp(n1, 0.66), n1];
@@ -1075,7 +1095,7 @@ fn face(mb: &mut MB, s: &Sk) {
         &|i, th, c| {
             let y = HY[i];
             let fr = angdiff(th, PI * 0.5);
-            let mut c = c * (0.98 + 0.04 * hs(i as f32, th * 3.0));
+            let mut c = c * (0.99 + 0.02 * (th * 3.0 + i as f32).sin());
             c = tint(c, blush * gs(y + 0.03, 0.03) * gs(fr - 0.85, 0.4) + 0.3 * gs(y + 0.045, 0.012) * gs(fr, 0.15));
             c *= 1.0 - 0.07 * gs(y - 0.0, 0.012) * gs(fr, 0.7) - 0.06 * smooth(-0.1, -0.12, y);
             if s.old {
@@ -1441,12 +1461,14 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let ph = pose.phase;
     let tm = pose.time;
     let breathe = (tm * 1.6).sin() * (1.0 - walk * 0.7);
-    let bob = 0.014 * walk * (2.0 * ph).cos() - 0.010 * walk;
+    let bob = 0.018 * walk * (2.0 * ph).cos() - 0.012 * walk;
+    let lat = -0.02 * walk * ph.cos() + 0.008 * (tm * 0.5).sin() * (1.0 - walk);
+    let lean_x = 0.07 * walk;
     let tw_p = -0.10 * walk * ph.sin();
     let tw_c = 0.07 * walk * ph.sin();
-    let base = feet + Vec3::Y * bob;
     let f0 = vec3(pose.yaw.cos(), 0.0, pose.yaw.sin());
     let r0 = vec3(-pose.yaw.sin(), 0.0, pose.yaw.cos());
+    let base = feet + Vec3::Y * bob + r0 * lat;
     let fpel = frame(base, pose.yaw + tw_p);
     let fch = frame(base, pose.yaw + tw_c);
     let y = Vec3::Y;
@@ -1456,11 +1478,11 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
         let s = sd(i);
         let lp = ph + if i == 0 { 0.0 } else { PI };
         let sp = lp.sin();
-        let lift = lp.cos().max(0.0) * 0.11 * walk;
+        let lift = lp.cos().max(0.0).powf(0.8) * 0.12 * walk;
         let fy = pose.yaw + s * 0.10;
         let ff = vec3(fy.cos(), 0.0, fy.sin());
-        let g0 = feet + r0 * (s * 0.092) + f0 * (sp * 0.30 * walk) + y * lift;
-        let pitch = (if sp > 0.0 { 0.30 * sp } else { 0.5 * sp }) * walk;
+        let g0 = feet + r0 * (s * 0.092) + f0 * ((0.5 * sp + 0.5 * (lp.sin().asin() * 0.6366)) * 0.30 * walk) + y * lift;
+        let pitch = (0.32 * smooth(0.55, 1.0, sp) - 0.55 * smooth(0.5, 1.0, -sp) + 0.15 * lp.cos().max(0.0)) * walk;
         let d = ff * pitch.cos() + y * pitch.sin();
         let u = y * pitch.cos() - ff * pitch.sin();
         let a0 = if pitch < 0.0 { 0.14 } else { -0.05 };
@@ -1480,9 +1502,9 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let fh = hf * pt.cos() - y * pt.sin();
     let uh = y * pt.cos() + hf * pt.sin();
     let rh = vec3(-hyaw.sin(), 0.0, hyaw.cos());
-    let hc = fch.p(0.012 + stoop, 1.705 + 0.003 * breathe, 0.0);
+    let hc = fch.p(0.012 + stoop + lean_x * 0.8, 1.705 + 0.003 * breathe, 0.0);
     // arms
-    let shx = if fem { 0.178 } else { 0.196 };
+    let shx = if fem { 0.158 } else { 0.178 };
     let mut sh = [Vec3::ZERO; 2];
     let mut wr = [Vec3::ZERO; 2];
     let mut el = [Vec3::ZERO; 2];
@@ -1491,7 +1513,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let mut curl = [0.3f32; 2];
     let mut tg: [Option<(Vec3, Vec3, Vec3, f32)>; 2] = [None, None];
     for i in 0..2 {
-        sh[i] = fch.p(0.0, 1.425 + 0.004 * breathe, sd(i) * shx);
+        sh[i] = fch.p(lean_x * 0.52, 1.425 + 0.004 * breathe, sd(i) * shx);
     }
     let it = pose.item;
     let mut rod: Option<(Vec3, Vec3)> = None;
@@ -1503,7 +1525,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     match it {
         Some(ItemKind::Rod) => {
             let dg = (fch.f * 0.8 - y * 0.35).normalize();
-            let tr = sh[0] + fch.f * 0.30 - y * 0.28 - fch.r * 0.08;
+            let tr = sh[0] + fch.f * 0.28 - y * 0.36 - fch.r * 0.07;
             let rdir = (fch.f + y * 0.55).normalize();
             let rb = palm_of(tr, dg) + y * 0.02 - rdir * 0.08;
             let dgl = (fch.f * 0.8 - y * 0.2).normalize();
@@ -1520,7 +1542,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
         }
         Some(ItemKind::Lantern) => {
             let dg = (-y * 0.9 + fch.f * 0.2).normalize();
-            let tl = sh[1] + fch.f * 0.10 - y * 0.47 - fch.r * 0.0;
+            let tl = sh[1] + fch.f * 0.08 - y * 0.50 - fch.r * 0.0;
             tg[1] = Some((tl, dg, fch.f, 1.0));
             lant = Some(palm_of(tl, dg));
         }
@@ -1531,7 +1553,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
             tin = Some(palm_of(tl, dg) + y * 0.05);
         }
         Some(ItemKind::Bucket) => {
-            let tr = sh[0] + fch.f * 0.03 - y * 0.50 + fch.r * 0.07;
+            let tr = sh[0] + fch.f * 0.03 - y * 0.53 + fch.r * 0.10;
             tg[0] = Some((tr, -y, fch.f, 1.0));
             bucket = Some(palm_of(tr, -y) - y * 0.17);
         }
@@ -1539,8 +1561,8 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     }
     for i in 0..2 {
         let s = sd(i);
-        let th = -s * 0.5 * ph.sin() * walk + (tm * 0.9 + s).sin() * 0.02 * (1.0 - walk);
-        let r = 0.53 - 0.05 * th.max(0.0);
+        let th = -s * 0.36 * ph.sin() * walk + (tm * 0.9 + s).sin() * 0.02 * (1.0 - walk);
+        let r = 0.567 - 0.017 * (th.max(0.0) / 0.36);
         let hang = sh[i] + (fch.f * th.sin() - y * th.cos()) * r + fch.r * s * 0.045;
         let pole = -fch.f * 0.5 - y * 0.3 + fch.r * s * 0.6;
         if let Some((t, d, n, c)) = tg[i] {
@@ -1563,13 +1585,15 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
         fem,
         old,
         lk: look.clone(),
-        skin: v3(SKIN[(look.skin as usize).min(5)].1),
+        lean: lean_x,
+        br: breathe,
+        skin: v3(SKIN[(look.skin as usize).min(5)].1) * 0.94,
         hair: v3(HAIRC[(look.hair_color as usize).min(7)].1),
         eye: v3(EYES[(look.eyes as usize).min(6)].1),
         tc: cl(look.top_color),
         sc: cl(look.sleeve_color),
         bc: cl(look.bottom_color),
-        feet,
+        feet: feet + r0 * lat,
         yaw: pose.yaw,
         bob,
         tw_p,

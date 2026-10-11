@@ -401,7 +401,7 @@ pub async fn run() {
     let sc = scatter(&terrain, &mut pool);
     cols.extend(sc.cols.iter().cloned());
     for t in &sc.trunks {
-        cols.push(Col::Circle { c: *t, r: 0.3, y0: -20.0, top: 1.0e9, walk: false });
+        cols.push(Col::Circle { c: *t, r: 0.42, y0: -20.0, top: 1.0e9, walk: false });
     }
     let cells = finish(pool);
     step!(0.68, "Filling the sea...");
@@ -624,6 +624,7 @@ pub async fn run() {
     let mut join_text = String::new();
     let mut join_focus = false;
     let mut nw = Net::new();
+    let was_join = matches!(launch, Launch::Join(_));
     match launch {
         Launch::Solo => {}
         Launch::Host => {
@@ -635,6 +636,9 @@ pub async fn run() {
             }
         }
         Launch::Join(code) => nw.join(&code),
+    }
+    if was_join && nw.mode == NetMode::Off && !nw.status.is_empty() {
+        toasts.push_back((format!("Couldn't join: {}", nw.status), 9.0));
     }
     let mut remotes: [Option<Remote>; 4] = [None, None, None, None];
     let mut net_clock: Option<(f32, f32)> = None;
@@ -1480,6 +1484,20 @@ pub async fn run() {
             shadow_text(&money, sw - tw - 16.0, 30.0 * hs + if st.show_clock { 28.0 * hs } else { 0.0 }, 26.0 * hs, Color::new(0.5, 0.95, 0.5, 1.0));
             if st.show_fps {
                 shadow_text(&format!("{:.0} FPS", fps_smooth), 14.0, 24.0 * hs, 22.0 * hs, Color::new(1.0, 1.0, 0.6, 1.0));
+            }
+            // always-visible multiplayer status so a failed join can't go unnoticed
+            {
+                let players = nw.names.iter().filter(|n| n.is_some()).count();
+                let (msg, col) = match nw.mode {
+                    NetMode::Host => (format!("ONLINE - hosting, {} player{} (code: Esc > Multiplayer)", players, if players == 1 { "" } else { "s" }), Color::new(0.5, 1.0, 0.6, 1.0)),
+                    NetMode::Client => (format!("ONLINE - you are Player {}, {} players in this world", nw.my_id + 1, players), Color::new(0.5, 1.0, 0.6, 1.0)),
+                    NetMode::Connecting => ("Connecting to the host...".to_string(), Color::new(1.0, 0.9, 0.5, 1.0)),
+                    NetMode::Off if was_join => ("NOT CONNECTED - you are alone in your own world (Esc > Multiplayer for the reason)".to_string(), Color::new(1.0, 0.45, 0.4, 1.0)),
+                    _ => (String::new(), WHITE),
+                };
+                if !msg.is_empty() {
+                    shadow_text(&msg, 14.0, 24.0 * hs + if st.show_fps { 26.0 * hs } else { 0.0 }, 18.0 * hs, col);
+                }
             }
             if st.show_hints {
                 let l = |s: &str, y: f32| shadow_text(s, 14.0, y * hs + if st.show_fps { 26.0 * hs } else { 0.0 }, 22.0 * hs, WHITE);

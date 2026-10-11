@@ -1,7 +1,8 @@
-#![windows_subsystem = "windows"]
+﻿#![windows_subsystem = "windows"]
 
 mod audio;
 mod items;
+mod bore;
 mod net;
 mod people;
 mod ui;

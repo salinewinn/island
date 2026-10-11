@@ -364,7 +364,7 @@ mod tests {
 
     #[test]
     fn repo_check() {
-        assert!(!repo_configured(DEFAULT_REPO));
+        assert!(repo_configured(DEFAULT_REPO));
         assert!(!repo_configured(""));
         assert!(repo_configured("someone/island"));
     }

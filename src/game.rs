@@ -1820,7 +1820,7 @@ pub async fn run() {
                                 }
                                 let notes = [
                                     "LAN code: friends on the same Wi-Fi/network or VPN (Tailscale, Hamachi).",
-                                    "Internet code: friends elsewhere (needs your router to allow it).",
+                                    "Internet code: friends anywhere in the world - no router setup, just share it.",
                                     "You can also type the host's IP address (for example 192.168.1.20) instead of a code.",
                                     "Windows may ask to allow the game through the firewall when you host.",
                                 ];
@@ -1842,7 +1842,7 @@ pub async fn run() {
                                         miniquad::window::clipboard_set(&nw.code);
                                         toasts.push_back(("LAN code copied".into(), 2.0));
                                     }
-                                    ui.text("Internet code - friends elsewhere (needs your router to allow it)", x, 205.0, 19.0, Color::new(0.8, 0.85, 0.9, 1.0));
+                                    ui.text("Internet code - friends anywhere in the world", x, 205.0, 19.0, Color::new(0.8, 0.85, 0.9, 1.0));
                                     if nw.inet_code.is_empty() {
                                         ui.text("(not available yet)", x, 231.0, 30.0, Color::new(1.0, 1.0, 1.0, 0.3));
                                     } else {
@@ -1855,11 +1855,13 @@ pub async fn run() {
                                     for (i, l) in wrap_lines(&ui, &nw.inet_status, 17.0, w).iter().take(3).enumerate() {
                                         ui.text(l, x, 282.0 + i as f32 * 21.0, 17.0, Color::new(1.0, 0.85, 0.5, 1.0));
                                     }
-                                    let busy = nw.inet_status.starts_with("Looking up");
-                                    if ui.button(x, 350.0, 290.0, 36.0, "Look up my public address", !busy, false) {
-                                        nw.lookup_public();
+                                    if nw.inet_code.is_empty() && !nw.inet_status.starts_with("Opening") {
+                                        let busy = nw.inet_status.starts_with("Looking up");
+                                        if ui.button(x, 350.0, 290.0, 36.0, "Look up my public address", !busy, false) {
+                                            nw.lookup_public();
+                                        }
+                                        ui.text("Backup if the tunnel is down: needs a router port forward.", x + 300.0, 359.0, 16.0, dim);
                                     }
-                                    ui.text("This contacts api.ipify.org to learn your public IP address.", x + 300.0, 359.0, 16.0, dim);
                                     ypos = 400.0;
                                 } else {
                                     for (i, l) in wrap_lines(&ui, &nw.status, 22.0, w).iter().take(3).enumerate() {

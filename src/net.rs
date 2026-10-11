@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 pub const PORT: u16 = 47321;
 pub const MAX_PLAYERS: usize = 4;
 /// Bump whenever the world or protocol changes: players must run the same build.
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 const ALPHA: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Host-side id of a connection that hasn't finished the HELLO handshake yet.
@@ -45,8 +45,10 @@ fn resolve(addr: &str) -> Result<SocketAddr, String> {
     addr.to_socket_addrs().map_err(|e| format!("couldn't find the relay server ({e})"))?.next().ok_or_else(|| "couldn't find the relay server".to_string())
 }
 
-enum RelayMsg {
+pub enum RelayMsg {
     Ready,
+    /// internet tunnel open: visitors connect to this address
+    Tunnel(Ipv4Addr, u16),
     Stream(TcpStream),
     Failed(String),
 }
@@ -230,6 +232,8 @@ pub struct Net {
     next_uid: u32,
     /// ask the router for a port mapping when hosting (tests switch this off)
     pub use_upnp: bool,
+    /// open a bore.pub tunnel for internet play (tests switch this off)
+    pub use_tunnel: bool,
     hello_timeout: Duration,
     idle_timeout: Duration,
     keepalive: Duration,
@@ -473,7 +477,8 @@ impl Net {
             looks: [None, None, None, None],
             my_look: None,
             next_uid: 1,
-            use_upnp: true,
+            use_upnp: false,
+            use_tunnel: true,
             hello_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(60),
             keepalive: Duration::from_secs(3),
@@ -523,13 +528,21 @@ impl Net {
             let (room, stop) = (self.relay_room.clone(), self.relay_stop.clone());
             std::thread::spawn(move || relay_host_thread(raddr, room, rtx, stop));
             self.relay_rx = Some(rrx);
+        } else if self.use_tunnel {
+            let (rtx, rrx) = channel();
+            let stop = self.relay_stop.clone();
+            std::thread::spawn(move || crate::bore::host_thread(rtx, stop));
+            self.relay_rx = Some(rrx);
+            self.inet_status = "Opening an internet tunnel...".into();
         }
         self.status = if lan == Ipv4Addr::LOCALHOST {
             "Hosting, but no network connection was found - only players on this PC can join.".into()
         } else {
             "Hosting. Friends on your network can use the LAN code.".into()
         };
-        if self.use_upnp && lan != Ipv4Addr::LOCALHOST {
+        if self.relay_rx.is_some() {
+            // the internet code comes from the relay / internet server; no router setup needed
+        } else if self.use_upnp && lan != Ipv4Addr::LOCALHOST {
             self.inet_status = "Asking your router to open the port (UPnP)...".into();
             let (tx, rx) = channel();
             // wait for any earlier mapping removal first, so it can't delete the new mapping
@@ -577,13 +590,13 @@ impl Net {
             Ok((addr, nonce)) => {
                 let mut addr = addr;
                 if addr.port() == RELAY_MARK {
-                    let Some(raddr) = relay_addr() else {
-                        self.status = "This is an internet room code but this build has no relay server configured.".into();
-                        return;
-                    };
                     let ip = match addr.ip() {
                         std::net::IpAddr::V4(v) => u32::from(v),
                         _ => 0,
+                    };
+                    let Some(raddr) = relay_addr() else {
+                        self.status = "This is an old-style internet room code. Ask the host to update the game.".into();
+                        return;
                     };
                     self.join_relay_room = Some(format!("{:08x}{:04x}", ip, nonce));
                     match resolve(&raddr) {
@@ -751,6 +764,11 @@ impl Net {
                     self.relay_ready = true;
                     self.inet_code = self.relay_code_cache.clone();
                     self.inet_status = "Internet relay connected - share the internet code. It works from anywhere, no router setup.".into();
+                }
+                RelayMsg::Tunnel(ip, port) => {
+                    self.relay_ready = true;
+                    self.inet_code = encode(ip, port, self.nonce);
+                    self.inet_status = "Online - share the internet code. It works from anywhere, no router setup.".into();
                 }
                 RelayMsg::Stream(s) => {
                     if self.mode == Mode::Host && self.peers.len() < MAX_PENDING + MAX_PLAYERS {
@@ -1221,6 +1239,7 @@ mod tests {
         fn host() -> T {
             let mut n = Net::new();
             n.use_upnp = false;
+            n.use_tunnel = false;
             n.host().expect("host");
             T { n, ev: vec![] }
         }
@@ -1365,6 +1384,53 @@ mod tests {
         // a late joiner learns what was already picked up
         let mut c3 = T::client(&code);
         wait(all!(h, c1, c2, c3), "c3", |t| t[3].has(|e| matches!(e, NetEvent::Pick(77))));
+    }
+
+    /// Real internet test: goes through the public bore.pub tunnel (needs internet access).
+    #[test]
+    fn internet_code_through_tunnel() {
+        let _g = lock();
+        let mut hn = Net::new();
+        hn.use_upnp = false;
+        hn.host().expect("host");
+        let mut h = T { n: hn, ev: vec![] };
+        let t0 = Instant::now();
+        while h.n.inet_code.is_empty() {
+            h.poll();
+            assert!(t0.elapsed() < Duration::from_secs(15), "no internet code: {}", h.n.inet_status);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let code = h.n.inet_code.clone();
+        let mut c1 = T::client(&code);
+        wait(all!(h, c1), "c1 welcome", |t| welcomed(t[1]));
+        let mut c2 = T::client(&code);
+        wait(all!(h, c1, c2), "c2 welcome", |t| welcomed(t[2]));
+        let st = |x: f32| PlayerNet { pos: [x, 2.0, 3.0], ..Default::default() };
+        c1.n.send_state(&st(10.0));
+        h.n.send_state(&st(5.0));
+        c2.n.send_msg("hello world");
+        let seen = |t: &T, id: u8, x: f32| t.has(|e| matches!(e, NetEvent::State(s) if s.id == id && (s.pos[0] - x).abs() < 0.01));
+        wait(all!(h, c1, c2), "relay over internet", |t| {
+            seen(t[0], 1, 10.0)
+                && seen(t[2], 1, 10.0)
+                && seen(t[1], 0, 5.0)
+                && t[0].has(|e| matches!(e, NetEvent::Msg(m) if m == "hello world"))
+                && t[1].has(|e| matches!(e, NetEvent::Msg(m) if m == "hello world"))
+        });
+        // a new room each time
+        let first = code.clone();
+        h.n.leave();
+        h.n.host().expect("host again");
+        let t1 = Instant::now();
+        while h.n.inet_code.is_empty() {
+            h.poll();
+            assert!(t1.elapsed() < Duration::from_secs(15));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(first, h.n.inet_code);
+        // leaving is noticed
+        c1.n.leave();
+        c2.n.leave();
     }
 
     #[test]

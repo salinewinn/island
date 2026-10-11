@@ -24,6 +24,113 @@ const MAX_LINE: usize = 64 * 1024;
 const MAX_MSG_CHARS: usize = 500;
 const MAX_PENDING: usize = 16;
 
+/// Address (host:port) of the relay server that lets players behind home routers play together
+/// over the internet with just a room code. Empty = relay disabled. The environment variable
+/// ISLAND_RELAY overrides it (handy for testing).
+pub const RELAY_ADDR: &str = "";
+/// Room codes whose "port" field is this value are relay codes (the "address" field is the room id).
+const RELAY_MARK: u16 = 0xFFFF;
+
+pub fn relay_addr() -> Option<String> {
+    if let Ok(v) = std::env::var("ISLAND_RELAY") {
+        if !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    if RELAY_ADDR.is_empty() { None } else { Some(RELAY_ADDR.to_string()) }
+}
+
+fn resolve(addr: &str) -> Result<SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    addr.to_socket_addrs().map_err(|e| format!("couldn't find the relay server ({e})"))?.next().ok_or_else(|| "couldn't find the relay server".to_string())
+}
+
+enum RelayMsg {
+    Ready,
+    Stream(TcpStream),
+    Failed(String),
+}
+
+/// Registers the room with the relay and keeps the control connection alive; for every joiner the
+/// relay announces ("NEW id") it opens a data connection and hands it to the game as a stream.
+fn relay_host_thread(addr: String, room: String, tx: std::sync::mpsc::Sender<RelayMsg>, stop: Arc<AtomicBool>) {
+    let sa = match resolve(&addr) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Failed(e));
+            return;
+        }
+    };
+    let mut s = match TcpStream::connect_timeout(&sa, Duration::from_secs(8)) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = tx.send(RelayMsg::Failed(format!("couldn't reach the relay server ({e})")));
+            return;
+        }
+    };
+    let _ = s.set_nodelay(true);
+    let _ = s.set_read_timeout(Some(Duration::from_secs(8)));
+    if s.write_all(format!("HOST {room}\n").as_bytes()).is_err() {
+        let _ = tx.send(RelayMsg::Failed("the relay server hung up".into()));
+        return;
+    }
+    let mut acc: Vec<u8> = vec![];
+    let mut buf = [0u8; 512];
+    let mut ready = false;
+    let mut last_ping = Instant::now();
+    let _ = s.set_read_timeout(Some(Duration::from_millis(800)));
+    let started = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if ready && last_ping.elapsed() > Duration::from_secs(15) {
+            last_ping = Instant::now();
+            if s.write_all(b"PING\n").is_err() {
+                let _ = tx.send(RelayMsg::Failed("lost the relay connection".into()));
+                return;
+            }
+        }
+        match s.read(&mut buf) {
+            Ok(0) => {
+                let _ = tx.send(RelayMsg::Failed("the relay server closed the connection".into()));
+                return;
+            }
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => {
+                let _ = tx.send(RelayMsg::Failed(format!("lost the relay connection ({e})")));
+                return;
+            }
+        }
+        if !ready && started.elapsed() > Duration::from_secs(10) {
+            let _ = tx.send(RelayMsg::Failed("the relay server didn't answer".into()));
+            return;
+        }
+        while let Some(p) = acc.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = acc.drain(..=p).collect();
+            let line = String::from_utf8_lossy(&line).trim().to_string();
+            if line == "OK" {
+                ready = true;
+                let _ = tx.send(RelayMsg::Ready);
+            } else if let Some(msg) = line.strip_prefix("ERR") {
+                let _ = tx.send(RelayMsg::Failed(msg.trim().to_string()));
+                return;
+            } else if let Some(id) = line.strip_prefix("NEW ") {
+                let (tx2, room2, id2) = (tx.clone(), room.clone(), id.trim().to_string());
+                std::thread::spawn(move || {
+                    if let Ok(mut d) = TcpStream::connect_timeout(&sa, Duration::from_secs(8)) {
+                        let _ = d.set_nodelay(true);
+                        if d.write_all(format!("ACCEPT {room2} {id2}\n").as_bytes()).is_ok() {
+                            let _ = tx2.send(RelayMsg::Stream(d));
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PlayerNet {
     pub id: u8,
@@ -111,6 +218,12 @@ pub struct Net {
     join_ver: u32,
     welcomed: bool,
     late_events: Vec<NetEvent>,
+    relay_rx: Option<Receiver<RelayMsg>>,
+    relay_stop: Arc<AtomicBool>,
+    relay_room: String,
+    relay_ready: bool,
+    join_relay_room: Option<String>,
+    relay_code_cache: String,
     removed: Vec<u32>,
     looks: [Option<String>; MAX_PLAYERS],
     my_look: Option<String>,
@@ -350,6 +463,12 @@ impl Net {
             join_ver: VERSION,
             welcomed: false,
             late_events: vec![],
+            relay_rx: None,
+            relay_stop: Arc::new(AtomicBool::new(false)),
+            relay_room: String::new(),
+            relay_ready: false,
+            join_relay_room: None,
+            relay_code_cache: String::new(),
             removed: vec![],
             looks: [None, None, None, None],
             my_look: None,
@@ -392,6 +511,19 @@ impl Net {
         self.code = encode(lan, self.port, self.nonce);
         self.inet_code.clear();
         self.removed.clear();
+        self.relay_ready = false;
+        self.relay_stop.store(true, Ordering::Relaxed);
+        self.relay_stop = Arc::new(AtomicBool::new(false));
+        self.relay_rx = None;
+        if let Some(raddr) = relay_addr() {
+            let r32 = ((fresh_nonce(self.nonce ^ 0x5a5a) as u32) << 16) | fresh_nonce(self.nonce.wrapping_add(0x1234)) as u32;
+            self.relay_room = format!("{:08x}{:04x}", r32, self.nonce);
+            self.relay_code_cache = encode(Ipv4Addr::from(r32), RELAY_MARK, self.nonce);
+            let (rtx, rrx) = channel();
+            let (room, stop) = (self.relay_room.clone(), self.relay_stop.clone());
+            std::thread::spawn(move || relay_host_thread(raddr, room, rtx, stop));
+            self.relay_rx = Some(rrx);
+        }
         self.status = if lan == Ipv4Addr::LOCALHOST {
             "Hosting, but no network connection was found - only players on this PC can join.".into()
         } else {
@@ -443,6 +575,26 @@ impl Net {
         match decode(text) {
             Err(e) => self.status = e,
             Ok((addr, nonce)) => {
+                let mut addr = addr;
+                if addr.port() == RELAY_MARK {
+                    let Some(raddr) = relay_addr() else {
+                        self.status = "This is an internet room code but this build has no relay server configured.".into();
+                        return;
+                    };
+                    let ip = match addr.ip() {
+                        std::net::IpAddr::V4(v) => u32::from(v),
+                        _ => 0,
+                    };
+                    self.join_relay_room = Some(format!("{:08x}{:04x}", ip, nonce));
+                    match resolve(&raddr) {
+                        Ok(a) => addr = a,
+                        Err(e) => {
+                            self.status = e;
+                            self.join_relay_room = None;
+                            return;
+                        }
+                    }
+                }
                 self.join_nonce = nonce;
                 self.join_ver = version;
                 let (tx, rx) = channel();
@@ -465,6 +617,10 @@ impl Net {
     /// mapping (if any) is removed in the background.
     pub fn leave(&mut self) {
         self.listener = None;
+        self.relay_stop.store(true, Ordering::Relaxed);
+        self.relay_rx = None;
+        self.relay_ready = false;
+        self.join_relay_room = None;
         self.peers.clear();
         self.connect_rx = None;
         self.pub_rx = None;
@@ -580,11 +736,35 @@ impl Net {
     }
 
     fn set_inet(&mut self, ip: Ipv4Addr, note: &str) {
+        if self.relay_ready {
+            return; // the relay code already works from anywhere
+        }
         self.inet_code = encode(ip, self.port, self.nonce);
         self.inet_status = note.to_string();
     }
 
     fn poll_background(&mut self) {
+        let msgs: Vec<RelayMsg> = self.relay_rx.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for m in msgs {
+            match m {
+                RelayMsg::Ready => {
+                    self.relay_ready = true;
+                    self.inet_code = self.relay_code_cache.clone();
+                    self.inet_status = "Internet relay connected - share the internet code. It works from anywhere, no router setup.".into();
+                }
+                RelayMsg::Stream(s) => {
+                    if self.mode == Mode::Host && self.peers.len() < MAX_PENDING + MAX_PLAYERS {
+                        let uid = self.next_uid;
+                        self.next_uid += 1;
+                        self.peers.push(Peer::new(s, uid, NO_ID, Instant::now()));
+                    }
+                }
+                RelayMsg::Failed(e) => {
+                    self.relay_ready = false;
+                    self.inet_status = format!("Internet relay unavailable ({e}). Friends on your network can still use the LAN code.");
+                }
+            }
+        }
         if let Some(rx) = &self.upnp_rx {
             if let Ok(res) = rx.try_recv() {
                 self.upnp_rx = None;
@@ -637,6 +817,9 @@ impl Net {
                         let uid = self.next_uid;
                         self.next_uid += 1;
                         let mut peer = Peer::new(stream, uid, 0, now);
+                        if let Some(room) = self.join_relay_room.clone() {
+                            peer.out.extend_from_slice(format!("JOIN {room}\n").as_bytes());
+                        }
                         peer.out.extend_from_slice(format!("HELLO {} {}\n", self.join_ver, self.join_nonce).as_bytes());
                         self.peers.push(peer);
                         self.mode = Mode::Client;
@@ -786,6 +969,7 @@ impl Net {
         let (cmd, rest) = line.split_once(' ').unwrap_or((line, ""));
         let rest = rest.trim();
         match cmd {
+            "ERR" => return Some(rest.to_string()),
             "FULL" => return Some("That room is full (4 players max)".into()),
             "BADVER" => {
                 return Some(format!(

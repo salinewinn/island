@@ -234,6 +234,8 @@ pub struct Settings {
     pub sens: f32,
     pub invert_y: bool,
     pub fov: f32,
+    /// master sound volume 0..1
+    pub volume: f32,
     pub binds: Vec<Bind>,
     /// model detail level 0..3 (Low, Medium, High, Ultra); applies when the world is built
     pub detail: usize,
@@ -241,6 +243,8 @@ pub struct Settings {
     pub look: String,
     /// check GitHub for a newer release when the game starts
     pub auto_update: bool,
+    /// sync to the monitor's refresh (smooth, and much better for screen sharing); needs a restart
+    pub vsync: bool,
     /// "owner/name" of the GitHub repository that publishes releases
     pub update_repo: String,
 }
@@ -261,10 +265,12 @@ impl Settings {
             sens: 1.0,
             invert_y: false,
             fov: 70.0,
+            volume: 0.7,
             binds: ACTS.iter().map(|a| default_bind(*a)).collect(),
             detail: 2,
             look: Look::default_for(0).encode(),
             auto_update: true,
+            vsync: true,
             update_repo: crate::update::DEFAULT_REPO.to_string(),
         };
         s.apply_preset(2);
@@ -327,8 +333,10 @@ impl Settings {
                     "sens" => s.sens = fl().unwrap_or(1.0).clamp(0.2, 3.0),
                     "invert_y" => s.invert_y = bo(),
                     "fov" => s.fov = fl().unwrap_or(70.0).clamp(55.0, 110.0),
+                    "volume" => s.volume = fl().unwrap_or(0.7).clamp(0.0, 1.0),
                     "detail" => s.detail = v.parse::<usize>().unwrap_or(2).min(3),
                     "auto_update" => s.auto_update = bo(),
+                    "vsync" => s.vsync = bo(),
                     "update_repo" => {
                         if v.contains('/') && v.len() < 100 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.') {
                             s.update_repo = v.to_string();
@@ -357,8 +365,8 @@ impl Settings {
         let b = |x: bool| if x { "1" } else { "0" };
         t += &format!("res={}\nfullscreen={}\nfps={}\npreset={}\ndraw_dist={}\nwater_q={}\nbump={}\n", self.res, b(self.fullscreen), self.fps, self.preset, self.draw_dist, self.water_q, b(self.bump));
         t += &format!("show_fps={}\nshow_clock={}\nshow_hints={}\nsens={}\ninvert_y={}\nfov={}\n", b(self.show_fps), b(self.show_clock), b(self.show_hints), self.sens, b(self.invert_y), self.fov);
-        t += &format!("detail={}\nlook={}\n", self.detail.min(3), self.look);
-        t += &format!("auto_update={}\nupdate_repo={}\n", b(self.auto_update), self.update_repo);
+        t += &format!("detail={}\nlook={}\nvolume={}\n", self.detail.min(3), self.look, self.volume);
+        t += &format!("auto_update={}\nupdate_repo={}\nvsync={}\n", b(self.auto_update), self.update_repo, b(self.vsync));
         for (i, a) in ACTS.iter().enumerate() {
             t += &format!("bind.{}={}\n", act_id(*a), bind_to_str(self.binds[i]));
         }
@@ -452,7 +460,11 @@ impl Ui {
         self.outline(x, y, w, h, 1.5, Color::new(1.0, 1.0, 1.0, if hot { 0.5 } else { 0.18 }));
         let tc = if on { WHITE } else { Color::new(0.5, 0.5, 0.55, 1.0) };
         self.text_c(label, x + w * 0.5, y + h * 0.5, 22.0, tc);
-        on && hot && self.clicked
+        let hit = on && hot && self.clicked;
+        if hit {
+            crate::audio::ui_click();
+        }
+        hit
     }
     pub fn toggle(&mut self, x: f32, y: f32, w: f32, label: &str, v: &mut bool) -> bool {
         self.text(label, x, y + 8.0, 22.0, WHITE);
@@ -1345,7 +1357,10 @@ pub fn tab_graphics(ui: &mut Ui, st: &mut Settings, x: f32, w: f32) {
     let fov_txt = format!("{:.0}", st.fov);
     ui.slider(2, x, 452.0, w, "Field of view", &mut st.fov, 55.0, 110.0, &fov_txt);
     ui.toggle(x, 512.0, w, "Show FPS counter", &mut st.show_fps);
+    ui.toggle(x, 516.0, w, "VSync (smoother, restart to apply)", &mut st.vsync);
     ui.text("Presets change draw distance, water, surface and model detail.", x, 568.0, 17.0, NOTE);
+    let vol_txt = format!("{:.0}%", st.volume * 100.0);
+    ui.slider(4, x, 600.0, w, "Master volume", &mut st.volume, 0.0, 1.0, &vol_txt);
 }
 
 pub fn tab_display(ui: &mut Ui, st: &mut Settings, x: f32, w: f32) {

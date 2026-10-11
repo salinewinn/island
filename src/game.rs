@@ -72,7 +72,7 @@ pub fn window_conf() -> macroquad::conf::Conf {
             window_width: 1280,
             window_height: 720,
             sample_count: 4,
-            platform: miniquad::conf::Platform { swap_interval: Some(0), ..Default::default() },
+            platform: miniquad::conf::Platform { swap_interval: Some(if crate::ui::Settings::load().vsync { 1 } else { 0 }), ..Default::default() },
             ..Default::default()
         },
         draw_call_vertex_capacity: 24000,
@@ -650,12 +650,20 @@ pub async fn run() {
     let mut intro: Option<f32> = if !continuing && !has_arg("--skipmenu") { Some(0.0) } else { None };
     let mut welcome_toast: Option<String> = if intro.is_some() { toasts.pop_back().map(|t| t.0) } else { None };
 
+    let mut sfx = crate::audio::Sfx::load().await;
+    let mut reel_acc = 0.0f32;
     let mut grabbed = false;
     let mut skip_mouse = 3;
     let mut frame_start = get_time();
     // sky clock (host / solo): sky_t = clock_base + time
     let mut clock_base = sky_start - get_time() as f32;
 
+    let dbg_host = has_arg("--host");
+    let mut dbg_code_written = false;
+    // text chat (Enter or T to talk to the other players)
+    let mut chat_open = false;
+    let mut chat_text = String::new();
+    let mut chat_log: VecDeque<(String, f32)> = VecDeque::new();
     loop {
         dbg_log("frame start");
         frame_start = frame_start.max(0.0);
@@ -733,7 +741,16 @@ pub async fn run() {
                         remote_looks[(id as usize).min(3)] = l;
                     }
                 }
-                NetEvent::Msg(m) => toasts.push_back((m, 5.0)),
+                NetEvent::Msg(m) => {
+                    // chat lines travel as "C|<name>|<text>", everything else is a game notice
+                    if let Some(rest) = m.strip_prefix("C|") {
+                        if let Some((who, text)) = rest.split_once('|') {
+                            chat_log.push_back((format!("{}: {}", who, text), 14.0));
+                        }
+                    } else {
+                        toasts.push_back((m, 5.0));
+                    }
+                }
                 NetEvent::Welcome(id) => {
                     toasts.push_back((format!("Connected! You are Player {}", id + 1), 4.0));
                     nw.send_look(&st.look);
@@ -745,12 +762,49 @@ pub async fn run() {
                 }
             }
         }
+        if dbg_host && !dbg_code_written && !nw.inet_code.is_empty() {
+            dbg_code_written = true;
+            let _ = std::fs::write(std::env::temp_dir().join("island_code.txt"), format!("{}\n{}", nw.code, nw.inet_code));
+        }
         if nw.mode == NetMode::Off && remotes.iter().any(|r| r.is_some()) {
             remotes = [None, None, None, None];
         }
 
         // ---------- window / menu control ----------
-        if is_key_pressed(KeyCode::Escape) && rebinding.is_none() {
+        // ---------- chat input ----------
+        let mut chat_esc = false;
+        if chat_open {
+            while let Some(ch) = get_char_pressed() {
+                if !ch.is_control() && chat_text.chars().count() < 120 {
+                    chat_text.push(ch);
+                }
+            }
+            if is_key_pressed(KeyCode::Backspace) {
+                chat_text.pop();
+            }
+            if is_key_pressed(KeyCode::Escape) {
+                chat_open = false;
+                chat_text.clear();
+                chat_esc = true;
+            } else if is_key_pressed(KeyCode::Enter) {
+                let msg = chat_text.trim().to_string();
+                if !msg.is_empty() {
+                    if nw.mode == NetMode::Host || nw.mode == NetMode::Client {
+                        let who = format!("Player {}", nw.my_id + 1);
+                        chat_log.push_back((format!("{}: {}", who, msg), 14.0));
+                        nw.send_msg(&format!("C|{}|{}", who, msg.replace('|', "/")));
+                    } else {
+                        toasts.push_back(("Chat only works in a multiplayer game (Esc > Multiplayer)".into(), 4.0));
+                    }
+                }
+                chat_open = false;
+                chat_text.clear();
+            }
+        } else if screen == Screen::None && (is_key_pressed(KeyCode::Enter) || is_key_pressed(KeyCode::T)) {
+            chat_open = true;
+            while get_char_pressed().is_some() {}
+        }
+        if is_key_pressed(KeyCode::Escape) && rebinding.is_none() && !chat_esc {
             screen = match screen {
                 Screen::None => Screen::Pause(0),
                 _ => {
@@ -760,7 +814,13 @@ pub async fn run() {
             };
             join_focus = false;
         }
-        let want_grab = screen == Screen::None;
+        // the mouse is only locked to the game while it is the active window: alt-tab, the Windows
+        // key, a second monitor or holding Left Alt all give the cursor back
+        let focused = window_has_focus();
+        let want_grab = screen == Screen::None && focused && !is_key_down(KeyCode::LeftAlt);
+        if !want_grab {
+            release_cursor_clip();
+        }
         if want_grab != grabbed {
             grabbed = want_grab;
             set_cursor_grab(want_grab);
@@ -773,7 +833,7 @@ pub async fn run() {
             st.fullscreen = !st.fullscreen;
             set_fullscreen(st.fullscreen);
         }
-        let in_menu_now = screen != Screen::None;
+        let in_menu_now = screen != Screen::None || chat_open;
 
         // ---------- fishing lock (can't look/move while fighting a fish) ----------
         let fighting = matches!(fs, FS::Bite { .. } | FS::Reeling { .. });
@@ -802,12 +862,14 @@ pub async fn run() {
                     slot = i;
                     slot_label_t = 1.6;
                     fs = FS::Idle;
+                    sfx.play(crate::audio::Snd::Tick, 1.0);
                 }
             }
             let wheel = mouse_wheel().1;
             if wheel.abs() > 0.1 && !fighting {
                 slot = (slot as i32 + if wheel > 0.0 { -1 } else { 1 }).rem_euclid(5) as usize;
                 slot_label_t = 1.6;
+                sfx.play(crate::audio::Snd::Tick, 1.0);
                 fs = FS::Idle;
             }
         }
@@ -906,6 +968,30 @@ pub async fn run() {
         let eye = feet + Vec3::Y * (1.7 + bob);
         let eye_wy = water_h(&terrain, eye.x, eye.z, time);
         let under = eye.y < eye_wy - 0.02 && terrain.at(eye.x, eye.z) < eye.y;
+        {
+            use crate::audio::{AmbCtx, Surface};
+            let on_dock = dock.contains(feet.x, feet.z) && feet.y >= dock.deck_y - 0.3;
+            let on_stuff = matches!(stand_on(&cols, feet.x, feet.z, feet.y), Some(t) if (feet.y - t).abs() < 0.25);
+            let th = terrain.at(feet.x, feet.z);
+            let ctx = AmbCtx {
+                volume: st.volume,
+                feet,
+                fire: plaza.fire_pos,
+                day_f: sky.day_f,
+                under,
+                swim,
+                moving,
+                grounded,
+                sprint,
+                vy,
+                walk_speed,
+                surface: if on_dock || on_stuff { Surface::Wood } else if th < 1.0 { Surface::Sand } else { Surface::Grass },
+                wading: !swim && !on_dock && th < -0.25,
+                on_dock,
+                height: &|x, z| terrain.at(x, z),
+            };
+            sfx.update(&ctx, dt);
+        }
         let camup = right.cross(fwd).normalize_or_zero();
 
         // ---------- interaction targets ----------
@@ -946,6 +1032,7 @@ pub async fn run() {
                 coconuts.swap_remove(i);
                 nw.send_pick(id);
                 held += 1;
+                sfx.play(crate::audio::Snd::Pop, 1.0);
                 toasts.push_back(("Picked up a coconut".into(), 2.0));
                 coco_target = None;
             }
@@ -953,12 +1040,14 @@ pub async fn run() {
         if !in_menu_now && sel == Some(ItemKind::Coconut) {
             if held > 0 && st.pressed(Act::Drink) {
                 held -= 1;
+                sfx.play(crate::audio::Snd::Gulp, 1.0);
                 toasts.push_back(("You cracked one open and drank it. Delicious!".into(), 3.0));
             }
             if held > 0 && st.pressed(Act::Drop) {
                 held -= 1;
                 let id = (nw.my_id as u32 + 1) * 1_000_000 + next_local_cid;
                 next_local_cid += 1;
+                sfx.play(crate::audio::Snd::Thump, 0.6);
                 let (p, v) = (eye + fwd * 0.6 - camup * 0.2, fwd * 1.5);
                 coconuts.push(Coconut { id, pos: p, vel: v, spin: 0.0, rest: false });
                 nw.send_spawn(id, p.to_array(), v.to_array());
@@ -967,6 +1056,7 @@ pub async fn run() {
                 held -= 1;
                 let id = (nw.my_id as u32 + 1) * 1_000_000 + next_local_cid;
                 next_local_cid += 1;
+                sfx.play(crate::audio::Snd::Throw, 1.0);
                 let (p, v) = (eye + fwd * 0.5 - camup * 0.15, fwd * 11.0 + Vec3::Y * 1.5);
                 coconuts.push(Coconut { id, pos: p, vel: v, spin: 0.0, rest: false });
                 nw.send_spawn(id, p.to_array(), v.to_array());
@@ -974,6 +1064,7 @@ pub async fn run() {
         }
         if !in_menu_now && sel == Some(ItemKind::Lantern) && st.pressed(Act::Use) {
             lantern_on = !lantern_on;
+            sfx.play(crate::audio::Snd::Lantern, 1.0);
         }
         if !in_menu_now && sel == Some(ItemKind::Bait) && st.pressed(Act::Use) {
             // cycle through the baits you own
@@ -1057,6 +1148,7 @@ pub async fn run() {
                                     }
                                 }
                                 cast_anim = 0.45;
+                                sfx.play(crate::audio::Snd::Cast, 1.0);
                                 fs = FS::Flying { u: 0.0, target: tg, q };
                             }
                             _ => {
@@ -1073,6 +1165,7 @@ pub async fn run() {
                     if nu >= 1.0 {
                         let bite_at = rf(4.0, 10.0) * bait_bite * rod.4 / (1.0 + 0.35 * q);
                         fs = FS::Waiting { t: 0.0, bite_at, target, q };
+                        sfx.play(crate::audio::Snd::LineSplash, 1.0);
                         lure = Some(vec3(target.x, wy_t, target.z));
                     } else {
                         let p = tip_guess.lerp(vec3(target.x, wy_t, target.z), nu) + Vec3::Y * (2.0 + dist * 0.08) * (PI * nu).sin();
@@ -1090,6 +1183,7 @@ pub async fn run() {
                         toasts.push_back(("Reeled in early".into(), 2.0));
                     } else if t + dt >= bite_at {
                         fs = FS::Bite { t: 0.0, target, q };
+                        sfx.play(crate::audio::Snd::Bite, 1.0);
                         toasts.push_back(("Something's biting! Click or pull the mouse back to hook it!".into(), 2.5));
                     } else {
                         fs = FS::Waiting { t: t + dt, bite_at, target, q };
@@ -1107,6 +1201,7 @@ pub async fn run() {
                         fs = FS::Reeling { prog: 0.3, target, q, fish, kg, t: 0.0 };
                     } else if t + dt > 1.7 {
                         fs = FS::Idle;
+                        sfx.play(crate::audio::Snd::Snap, 0.8);
                         toasts.push_back(("It got away...".into(), 2.5));
                     } else {
                         fs = FS::Bite { t: t + dt, target, q };
@@ -1118,6 +1213,13 @@ pub async fn run() {
                     let fish_pull = (0.07 + 0.011 * kg.min(15.0)) * struggle;
                     let np = (prog + pull - fish_pull * dt).min(1.0);
                     crank += pull * 55.0 + dt * 2.0;
+                    if pull > 0.0005 {
+                        reel_acc += pull.min(0.03) * 9.0 + dt * 1.5;
+                        if reel_acc >= 1.0 {
+                            reel_acc = 0.0;
+                            sfx.play(crate::audio::Snd::Reel, 1.0);
+                        }
+                    }
                     bend = 0.06 + (1.0 - np) * 0.05 + (time * 25.0).sin().abs() * 0.015;
                     let wy_t = water_h(&terrain, target.x, target.z, time);
                     let ease = np * np * (3.0 - 2.0 * np);
@@ -1128,6 +1230,7 @@ pub async fn run() {
                     bobber = Some(bp);
                     if np >= 1.0 {
                         catches.push((fish, kg));
+                        sfx.play(crate::audio::Snd::Caught, 1.0);
                         if best.map(|b| kg > b.1).unwrap_or(true) {
                             best = Some((fish, kg));
                         }
@@ -1144,6 +1247,7 @@ pub async fn run() {
                         fs = FS::Show { t: 0.0, fish, kg };
                     } else if np <= 0.0 {
                         fs = FS::Idle;
+                        sfx.play(crate::audio::Snd::Snap, 1.0);
                         toasts.push_back(("The fish broke free!".into(), 3.0));
                     } else {
                         fs = FS::Reeling { prog: np, target, q, fish, kg, t: t + dt };
@@ -1524,6 +1628,32 @@ pub async fn run() {
                     shadow_text(&s, cx - tw * 0.5, cy + 60.0 * hs, 28.0 * hs, WHITE);
                 }
             }
+            // chat box and recent chat lines (bottom left, above the hotbar row)
+            for c in chat_log.iter_mut() {
+                c.1 -= dt;
+            }
+            while chat_log.len() > 40 || matches!(chat_log.front(), Some((_, t)) if *t <= -30.0) {
+                chat_log.pop_front();
+            }
+            {
+                let show: Vec<&(String, f32)> = chat_log.iter().filter(|(_, t)| chat_open || *t > 0.0).collect();
+                let n = show.len().min(8);
+                let base = sh - 120.0 * hs;
+                for (i, (s, t)) in show.iter().rev().take(n).enumerate() {
+                    let a = if chat_open { 1.0 } else { (*t / 1.5).clamp(0.0, 1.0) };
+                    let y = base - i as f32 * 24.0 * hs - if chat_open { 34.0 * hs } else { 0.0 };
+                    draw_text(s, 15.0, y + 1.5, 22.0 * hs, Color::new(0.0, 0.0, 0.0, 0.7 * a));
+                    draw_text(s, 14.0, y, 22.0 * hs, Color::new(0.95, 0.97, 1.0, a));
+                }
+                if chat_open {
+                    let by = sh - 118.0 * hs;
+                    draw_rectangle(10.0, by, 520.0 * hs, 30.0 * hs, Color::new(0.0, 0.0, 0.0, 0.65));
+                    draw_rectangle_lines(10.0, by, 520.0 * hs, 30.0 * hs, 2.0, Color::new(0.5, 0.9, 0.8, 0.9));
+                    let cursor = if (get_time() * 2.0) as i32 % 2 == 0 { "|" } else { "" };
+                    draw_text(&format!("{}{}", chat_text, cursor), 18.0, by + 22.0 * hs, 22.0 * hs, WHITE);
+                    draw_text("Enter = send, Esc = cancel", 14.0, by - 6.0 * hs, 16.0 * hs, Color::new(1.0, 1.0, 1.0, 0.55));
+                }
+            }
             // toasts
             for t in toasts.iter_mut() {
                 t.1 -= dt;
@@ -1801,6 +1931,7 @@ pub async fn run() {
                 ui.text(&format!("Your catch: {} fish, worth {:.0} coins", catches.len(), total), px + 40.0, py + 112.0, 22.0, WHITE);
                 if ui.button(px + pw - 24.0 - 250.0 - 8.0, py + 102.0, 250.0, 44.0, "Sell all fish", !catches.is_empty(), true) {
                     coins += total.round() as i32;
+                    sfx.play(crate::audio::Snd::Coins, 1.0);
                     shop_msg = format!("Fine catch! Here's {:.0} coins.", total);
                     catches.clear();
                 }
@@ -1825,6 +1956,7 @@ pub async fn run() {
                         shop_row(&mut ui, lx, y, cw2, r.0, "Only for first-time anglers", "Not needed", false, false);
                     } else if shop_row(&mut ui, lx, y, cw2, r.0, &desc, &format!("{} coins", price), coins >= price, true) {
                         coins -= price;
+                        sfx.play(crate::audio::Snd::Coin, 1.0);
                         owned_rods[i] = true;
                         rod_tier = i;
                         hb_give(&mut hotbar, ItemKind::Rod);
@@ -1837,6 +1969,7 @@ pub async fn run() {
                     shop_row(&mut ui, lx, y, cw2, "Lantern", "Lights your way after dark", "Owned", false, false);
                 } else if shop_row(&mut ui, lx, y, cw2, "Lantern", "Lights your way after dark", &format!("{} coins", LANTERN_PRICE), coins >= LANTERN_PRICE, true) {
                     coins -= LANTERN_PRICE;
+                    sfx.play(crate::audio::Snd::Coin, 1.0);
                     hb_give(&mut hotbar, ItemKind::Lantern);
                     shop_msg = "Click with it in hand to light it. Stay safe out there.".into();
                 }
@@ -1846,6 +1979,7 @@ pub async fn run() {
                     shop_row(&mut ui, lx, y, cw2, "Fish bucket", "See what you've caught so far", "Owned", false, false);
                 } else if shop_row(&mut ui, lx, y, cw2, "Fish bucket", "See what you've caught so far", &format!("{} coins", BUCKET_PRICE), coins >= BUCKET_PRICE, true) {
                     coins -= BUCKET_PRICE;
+                    sfx.play(crate::audio::Snd::Coin, 1.0);
                     hb_give(&mut hotbar, ItemKind::Bucket);
                     shop_msg = "Hold it up to see your catch.".into();
                 }
@@ -1855,6 +1989,7 @@ pub async fn run() {
                     let desc = format!("Pack of {}   Luck +{:.0}%   Faster bites", b.4, b.1 * 100.0);
                     if shop_row(&mut ui, rx, y, cw2, &format!("{}  (you have {})", b.0, baits[i]), &desc, &format!("{} coins", b.3), coins >= b.3, true) {
                         coins -= b.3;
+                        sfx.play(crate::audio::Snd::Coin, 1.0);
                         baits[i] += b.4;
                         bait_sel = i;
                         hb_give(&mut hotbar, ItemKind::Bait);
@@ -1882,6 +2017,7 @@ pub async fn run() {
                         toasts.push_back((tent_msg.clone(), 3.0));
                     } else {
                         sleep = Some((0.0, 20.0));
+                        sfx.play(crate::audio::Snd::Chime, 1.0);
                         screen = Screen::None;
                     }
                 }
@@ -1891,11 +2027,13 @@ pub async fn run() {
                         toasts.push_back((tent_msg.clone(), 3.0));
                     } else {
                         sleep = Some((0.0, DAY_LEN + 90.0));
+                        sfx.play(crate::audio::Snd::Chime, 1.0);
                         screen = Screen::None;
                     }
                 }
                 if ui.button(bx, py + 220.0, bw, 46.0, "Save game", true, true) {
                     let data = SaveData { coins, rod_tier, owned_rods, hotbar, baits, bait_sel, coconuts: held, lantern_on, catches: catches.clone(), best, sky_t };
+                    sfx.play(crate::audio::Snd::Chime, 0.8);
                     tent_msg = if data.write() { "Game saved.".into() } else { "Couldn't write the save file.".into() };
                     st.save();
                 }
@@ -1934,7 +2072,7 @@ pub async fn run() {
 
         // ---------- frame limiter ----------
         let cap = FPS_OPTS[st.fps.min(FPS_OPTS.len() - 1)];
-        if cap > 0 {
+        if cap > 0 && !st.vsync {
             let target = 1.0 / cap as f64;
             loop {
                 let used = get_time() - frame_start;
@@ -1949,3 +2087,42 @@ pub async fn run() {
         next_frame().await
     }
 }
+
+/// Is our window the one the user is working in? (false after alt-tab / Windows key / clicking
+/// another monitor)
+#[cfg(windows)]
+fn window_has_focus() -> bool {
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(h: isize, pid: *mut u32) -> u32;
+        fn GetCurrentProcessId() -> u32;
+    }
+    unsafe {
+        let h = GetForegroundWindow();
+        if h == 0 {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
+#[cfg(not(windows))]
+fn window_has_focus() -> bool {
+    true
+}
+
+/// Make sure Windows isn't still confining the cursor to the game window.
+#[cfg(windows)]
+fn release_cursor_clip() {
+    extern "system" {
+        fn ClipCursor(r: *const i32) -> i32;
+    }
+    unsafe {
+        ClipCursor(std::ptr::null());
+    }
+}
+
+#[cfg(not(windows))]
+fn release_cursor_clip() {}

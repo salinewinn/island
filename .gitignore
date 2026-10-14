@@ -3,3 +3,5 @@ island_settings.txt
 island_save.txt
 *.old
 *.new
+
+character/

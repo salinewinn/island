@@ -1460,7 +1460,7 @@ fn draw_rod(mb: &mut MB, base: Vec3, dir: Vec3, tier: u8, lure: Option<Vec3>, ey
 // ===========================================================================
 pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     mb.ensure(9000, 22000);
-    let v0 = mb.v.len();
+    let mut v0 = mb.v.len();
     let fem = look.female;
     let k: f32 = if fem { 0.935 } else { 1.0 };
     let old = look.hair_color == 5 || look.hair_color == 6;
@@ -1677,17 +1677,62 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
         uh,
         rh,
     };
-    torso(mb, &sk);
-    shirt(mb, &sk);
-    pants(mb, &sk);
-    for i in 0..2 {
-        shoe(mb, &sk, i);
-        arm(mb, &sk, i);
-    }
-    face(mb, &sk);
-    hair_and_beard(mb, &sk);
-    if look.hat > 0 {
-        hat(mb, &sk);
+    if !fem && crate::model::enabled() {
+        // realistic skinned model driven by the joints solved above; the swimming pose is applied
+        // here (the model spans several meshes, so the in-place rotation further down can't reach it)
+        let pivot = feet + Vec3::Y * (0.95 * k);
+        let (sn, cs) = 1.5f32.sin_cos();
+        let lift = (pose.surf - 0.12) - pivot.y + (tm * 1.7).sin() * 0.015;
+        let rot_n = |n: Vec3| -> Vec3 {
+            if !swimming {
+                return n;
+            }
+            let (a, b, c) = (n.dot(f0), n.y, n.dot(r0));
+            f0 * (a * cs + b * sn) + Vec3::Y * (b * cs - a * sn) + r0 * c
+        };
+        let rot_p = |v: Vec3| -> Vec3 {
+            if !swimming {
+                return v;
+            }
+            let d = v - pivot;
+            let (a, b, c) = (d.dot(f0), d.y, d.dot(r0));
+            pivot + f0 * (a * cs + b * sn) + Vec3::Y * (b * cs - a * sn) + r0 * c + Vec3::Y * lift
+        };
+        let joints = crate::model::Joints {
+            pel_base: sk.fpel.o,
+            pel_f: sk.fpel.f,
+            chest_base: sk.fch.o,
+            chest_f: sk.fch.f,
+            chest_r: sk.fch.r,
+            lean: sk.lean,
+            hip: sk.hip,
+            knee: sk.knee,
+            ank: sk.ank,
+            fd: sk.fd,
+            fu: sk.fu,
+            sh: sk.sh,
+            el: sk.el,
+            wr: sk.wr,
+            hd: sk.hd,
+            hc: sk.hc,
+            fh: sk.fh,
+            uh: sk.uh,
+        };
+        crate::model::draw(mb, &joints, &rot_p, &rot_n);
+        v0 = mb.v.len();
+    } else {
+        torso(mb, &sk);
+        shirt(mb, &sk);
+        pants(mb, &sk);
+        for i in 0..2 {
+            shoe(mb, &sk, i);
+            arm(mb, &sk, i);
+        }
+        face(mb, &sk);
+        hair_and_beard(mb, &sk);
+        if look.hat > 0 {
+            hat(mb, &sk);
+        }
     }
     // scale the whole body about the feet
     if (k - 1.0).abs() > 1e-4 {

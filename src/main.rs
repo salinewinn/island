@@ -3,6 +3,7 @@
 mod audio;
 mod fish;
 mod items;
+mod model;
 mod boat;
 mod bore;
 mod net;

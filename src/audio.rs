@@ -182,12 +182,16 @@ pub enum Snd {
     Motor,
     Bloop,
     Flop,
+    Heartbeat,
+    Scare,
+    Crash,
+    FlareShot,
 }
 
 /// Everything is played this much louder than the master slider says: the synthesised sounds are quiet.
 const LOUD: f32 = 1.9;
 
-pub const ALL: [Snd; 34] = [
+pub const ALL: [Snd; 38] = [
     Snd::StepSand,
     Snd::StepGrass,
     Snd::StepWood,
@@ -222,6 +226,10 @@ pub const ALL: [Snd; 34] = [
     Snd::Motor,
     Snd::Bloop,
     Snd::Flop,
+    Snd::Heartbeat,
+    Snd::Scare,
+    Snd::Crash,
+    Snd::FlareShot,
 ];
 
 fn variants(s: Snd) -> usize {
@@ -269,6 +277,10 @@ fn secs(s: Snd) -> f32 {
         Snd::Motor => 0.2,
         Snd::Bloop => 3.2,
         Snd::Flop => 0.3,
+        Snd::Heartbeat => 0.7,
+        Snd::Scare => 1.4,
+        Snd::Crash => 0.9,
+        Snd::FlareShot => 0.9,
     }
 }
 
@@ -309,6 +321,10 @@ fn base_vol(s: Snd) -> f32 {
         Snd::Motor => 0.5,
         Snd::Bloop => 0.9,
         Snd::Flop => 0.8,
+        Snd::Heartbeat => 0.9,
+        Snd::Scare => 1.0,
+        Snd::Crash => 1.0,
+        Snd::FlareShot => 0.8,
     }
 }
 
@@ -638,6 +654,58 @@ fn gen_oneshot(s: Snd, v: usize) -> Vec<f32> {
                 .map(|i| {
                     let t = i as f32 / RATE as f32;
                     nz[i] * (t / 0.004).min(1.0) * (-t * 22.0).exp() * 1.2 + sweep(t, 260.0 - vf * 40.0, 110.0, 25.0) * (-t * 18.0).exp() * 0.6
+                })
+                .collect()
+        }
+        Snd::Heartbeat => {
+            // lub-dub: two low thumps
+            let thump = |t: f32| -> f32 {
+                if t < 0.0 {
+                    return 0.0;
+                }
+                sweep(t, 90.0, 42.0, 30.0) * (t / 0.008).min(1.0) * (-t * 22.0).exp()
+            };
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    thump(t) + thump(t - 0.26) * 0.7
+                })
+                .collect()
+        }
+        Snd::Scare => {
+            // a rising, screeching swell with a low boom under it
+            let nz = lp_of(&noise(&mut r, n), 3200.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    let env = (t / 0.03).min(1.0) * (-t * 2.2).exp();
+                    let f = 380.0 + 900.0 * (t / d);
+                    let shriek = (TAU * f * t + 6.0 * (TAU * 31.0 * t).sin()).sin() * 0.5 + (TAU * f * 1.51 * t).sin() * 0.25;
+                    (shriek + nz[i] * 0.6) * env + sweep(t, 70.0, 36.0, 4.0) * (-t * 3.5).exp() * 0.9
+                })
+                .collect()
+        }
+        Snd::Crash => {
+            // splintering wood and a heavy thud
+            let nz = lp_of(&noise(&mut r, n), 2600.0);
+            let crack: Vec<f32> = (0..n).map(|_| if r.u() < 0.02 { r.n() } else { 0.0 }).collect();
+            let crack = lp_of(&crack, 4500.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    sweep(t, 110.0, 38.0, 12.0) * (-t * 7.0).exp() + nz[i] * (-t * 9.0).exp() * 0.8 + crack[i] * 4.0 * (-t * 5.0).exp()
+                })
+                .collect()
+        }
+        Snd::FlareShot => {
+            // a pop, then a hissing rise
+            let nz = lp_of(&noise(&mut r, n), 5200.0);
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / RATE as f32;
+                    let pop = sweep(t, 240.0, 70.0, 40.0) * (-t * 30.0).exp();
+                    let hiss = nz[i] * (t / 0.05).min(1.0) * (-((t - 0.25).abs()) * 3.0).exp() * 0.55;
+                    pop + hiss
                 })
                 .collect()
         }

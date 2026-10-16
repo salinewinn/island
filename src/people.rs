@@ -1430,7 +1430,7 @@ fn hat(mb: &mut MB, s: &Sk) {
 // Held items
 // ===========================================================================
 fn draw_rod(mb: &mut MB, base: Vec3, dir: Vec3, tier: u8, lure: Option<Vec3>, eye: Vec3, time: f32) {
-    let t = (tier as usize).min(3);
+    let t = (tier as usize).min(crate::items::N_RODS - 1);
     let col = vec3(RODS[t].6[0], RODS[t].6[1], RODS[t].6[2]);
     cyl(mb, base - dir * 0.04, base + dir * 0.32, 0.0225, 0.021, vec3(0.08, 0.08, 0.09), 8);
     cyl(mb, base + dir * 0.17, base + dir * 0.20, 0.026, 0.026, vec3(0.62, 0.64, 0.68), 8);
@@ -1548,6 +1548,7 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     let mut lant: Option<Vec3> = None;
     let mut tin: Option<Vec3> = None;
     let mut bucket: Option<Vec3> = None;
+    let mut gun: Option<(Vec3, Vec3)> = None;
     let palm_of = |w: Vec3, d: Vec3| w + d.normalize_or_zero() * 0.075;
     match it {
         Some(ItemKind::Rod) => {
@@ -1583,6 +1584,12 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
             let tr = sh[0] + fch.f * 0.03 - y * 0.53 + fch.r * 0.10;
             tg[0] = Some((tr, -y, fch.f, 1.0));
             bucket = Some(palm_of(tr, -y) - y * 0.17);
+        }
+        Some(ItemKind::FlareGun) => {
+            let dg = (fch.f * 0.92 + y * 0.12).normalize();
+            let tr = sh[0] + fch.f * 0.34 - y * 0.22 - fch.r * 0.03;
+            tg[0] = Some((tr, dg, y, 0.8));
+            gun = Some((palm_of(tr, dg), dg));
         }
         Some(ItemKind::Fish) => {
             let dg = (fch.f * 0.6 - y * 0.5).normalize();
@@ -1756,6 +1763,9 @@ pub fn draw_person(mb: &mut MB, feet: Vec3, look: &Look, pose: &Pose) {
     }
     if let Some(p) = bucket {
         draw_bucket(mb, w(p), Vec3::Y);
+    }
+    if let Some((p, d)) = gun {
+        draw_flare_gun(mb, w(p), d, Vec3::Y);
     }
     if let (Some(p), Some((sp, kg))) = (fishp, pose.fish) {
         let len = crate::fish::fish_len(sp, kg).min(0.95);

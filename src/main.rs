@@ -1,13 +1,17 @@
-﻿#![windows_subsystem = "windows"]
+#![windows_subsystem = "windows"]
 
 mod audio;
 mod fish;
+mod horror;
+mod islands;
 mod items;
 mod model;
 mod boat;
 mod bore;
 mod net;
 mod people;
+mod postfx;
+mod progress;
 mod ui;
 mod update;
 mod upnp;
@@ -17,6 +21,36 @@ use macroquad::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
+
+// ---------------------------------------------------------------------------
+// Smooth UI text: every `draw_text` / `measure_text` in the game goes through these two (they shadow
+// macroquad's blocky built-in font) and use the system's Segoe UI when it exists.
+// ---------------------------------------------------------------------------
+thread_local! {
+    static UI_FONT: RefCell<Option<Option<Font>>> = const { RefCell::new(None) };
+}
+
+fn ui_font() -> Option<Font> {
+    UI_FONT.with(|f| {
+        f.borrow_mut()
+            .get_or_insert_with(|| {
+                ["C:\\Windows\\Fonts\\segoeuisl.ttf", "C:\\Windows\\Fonts\\segoeui.ttf"]
+                    .iter()
+                    .find_map(|p| std::fs::read(p).ok().and_then(|b| load_ttf_font_from_bytes(&b).ok()))
+            })
+            .clone()
+    })
+}
+
+pub fn draw_text(text: impl AsRef<str>, x: f32, y: f32, font_size: f32, color: Color) -> TextDimensions {
+    let font = ui_font();
+    macroquad::text::draw_text_ex(text, x, y, TextParams { font: font.as_ref(), font_size: font_size.max(1.0) as u16, color, ..Default::default() })
+}
+
+pub fn measure_text(text: impl AsRef<str>, _font: Option<&Font>, font_size: u16, font_scale: f32) -> TextDimensions {
+    let font = ui_font();
+    macroquad::text::measure_text(text, font.as_ref(), font_size, font_scale)
+}
 
 // ---------------------------------------------------------------------------
 // World constants
@@ -30,7 +64,10 @@ const CW: f32 = 32.0; // chunk width (m)
 const NCH: i32 = 16;
 const MAXV: usize = 20000;
 const MAXI: usize = 24000;
-const SWIM_LIMIT: f32 = HALF - 10.0;
+/// How far you can swim or row from the middle of the map: effectively no edge (the sea goes on past the fog).
+const SWIM_LIMIT: f32 = 3000.0;
+/// The sea floor drops away to this depth far from the islands (a long way down, no invisible floor).
+const ABYSS: f32 = -60.0;
 const ISLES: [(f32, f32, f32, f32); 3] = [(0.0, 0.0, 82.0, 0.80), (125.0, -80.0, 44.0, 0.12), (-140.0, 100.0, 36.0, 0.08)];
 const DAY_LEN: f32 = 900.0; // 15 minutes of daylight
 const NIGHT_LEN: f32 = 600.0; // 10 minutes of night
@@ -155,7 +192,7 @@ fn island_h(x: f32, z: f32, c: (f32, f32), rad: (f32, f32), rot: f32, hill: f32,
     let w2 = fbm(x * nf * 4.0 + 1.7, z * nf * 4.0 + 9.2 + sd, 2 + seed, 3) - 0.5;
     let land = 1.0 - (d + w1 * 0.8 + w2 * 0.16);
     if land < 0.0 {
-        return (land * 11.0).max(-7.0);
+        return (land * 11.0).max(ABYSS);
     }
     let beach = smooth(0.0, 0.10, land) * 1.4;
     let inland = smooth(0.06, 0.55, land);
@@ -218,7 +255,7 @@ impl Terrain {
         let gx = (x + HALF) / CELL;
         let gz = (z + HALF) / CELL;
         if gx < 0.0 || gz < 0.0 || gx >= N as f32 || gz >= N as f32 {
-            return -7.0;
+            return ABYSS;
         }
         let ix = gx.floor() as usize;
         let iz = gz.floor() as usize;
@@ -1654,41 +1691,35 @@ struct Cell {
 fn build_terrain(t: &Terrain, pool: &mut HashMap<(i32, i32), MB>) {
     for cz in 0..NCH as usize {
         for cx in 0..NCH as usize {
-            let mut all_deep = true;
+            let mut maxh = f32::MIN;
             for iz in 0..=CHUNK {
                 for ix in 0..=CHUNK {
-                    if t.grid(cx * CHUNK + ix, cz * CHUNK + iz) > -6.5 {
-                        all_deep = false;
-                    }
+                    maxh = maxh.max(t.grid(cx * CHUNK + ix, cz * CHUNK + iz));
                 }
             }
-            if all_deep {
-                continue;
-            }
+            // the sea floor is built too (you can dive all the way down); deep chunks are coarser
+            let step = if maxh < -6.5 { 2usize } else { 1 };
+            let n = CHUNK / step;
             let mb = pool.entry((cx as i32, cz as i32)).or_insert_with(MB::new);
-            mb.ensure((CHUNK + 1) * (CHUNK + 1), CHUNK * CHUNK * 6);
+            mb.ensure((n + 1) * (n + 1), n * n * 6);
             let base = mb.v.len() as u16;
-            for iz in 0..=CHUNK {
-                for ix in 0..=CHUNK {
-                    let gx = cx * CHUNK + ix;
-                    let gz = cz * CHUNK + iz;
+            for iz in 0..=n {
+                for ix in 0..=n {
+                    let gx = cx * CHUNK + ix * step;
+                    let gz = cz * CHUNK + iz * step;
                     let x = -HALF + gx as f32 * CELL;
                     let z = -HALF + gz as f32 * CELL;
                     let h = t.grid(gx, gz);
-                    // wide-stencil normal: smooth shading across the 1.6 m grid
-                    let n = vec3(
-                        t.at(x - CELL, z) - t.at(x + CELL, z),
-                        2.0 * CELL,
-                        t.at(x, z - CELL) - t.at(x, z + CELL),
-                    )
-                    .normalize();
-                    let l = shade(ground_col(x, z, h, n), n);
+                    // wide-stencil normal: smooth shading across the grid
+                    let e = CELL * step as f32;
+                    let nrm = vec3(t.at(x - e, z) - t.at(x + e, z), 2.0 * e, t.at(x, z - e) - t.at(x, z + e)).normalize();
+                    let l = shade(ground_col(x, z, h, nrm), nrm);
                     mb.vert_uv(vec3(x, h, z), l, x, z);
                 }
             }
-            let w = (CHUNK + 1) as u16;
-            for iz in 0..CHUNK as u16 {
-                for ix in 0..CHUNK as u16 {
+            let w = (n + 1) as u16;
+            for iz in 0..n as u16 {
+                for ix in 0..n as u16 {
                     let a = base + iz * w + ix;
                     let b = a + 1;
                     let c = a + w;
@@ -1703,7 +1734,6 @@ fn build_terrain(t: &Terrain, pool: &mut HashMap<(i32, i32), MB>) {
         }
     }
 }
-
 fn sample_land(t: &Terrain, hmin: f32, hmax: f32, nymin: f32, nymax: f32) -> Option<(Vec3, Vec3)> {
     for _ in 0..800 {
         let r = rf(0.0, 1.0);
@@ -2117,7 +2147,7 @@ const WORLD_FS: &str = "#version 100
 precision highp float;
 varying vec2 uv; varying vec4 col; varying vec3 wp; varying vec3 nrm; varying float nw;
 uniform sampler2D Detail;
-uniform vec3 CamPos; uniform float Under; uniform float Lum; uniform float Bump;
+uniform vec3 CamPos; uniform float Under; uniform float Lum; uniform float Bump; uniform float FogK;
 uniform vec3 SunDir; uniform vec3 SunCol; uniform vec3 AmbCol; uniform vec3 FogCol;
 uniform vec3 P0; uniform vec3 C0; uniform vec3 P1; uniform vec3 C1; uniform vec3 P2; uniform vec3 C2; uniform vec3 P3; uniform vec3 C3;
 vec3 lamp(vec3 P, vec3 C, vec3 N){
@@ -2160,12 +2190,15 @@ void main(){
     c = albedo * L;
   }
   if (cloud < 0.5) {
-    float f = 1.0 - exp(-dist*dist*0.0000045);
+    float f = 1.0 - exp(-dist*dist*0.0000045*FogK);
     c = mix(c, FogCol, f);
   }
   if (Under > 0.5) {
-    float u = 1.0 - exp(-dist*0.11);
-    c = mix(c*vec3(0.45,0.75,0.85), vec3(0.01,0.15,0.24)*Lum, u);
+    // the deeper you are, the darker: the abyss is black
+    float dd = clamp(-CamPos.y, 0.0, 80.0);
+    float dark = exp(-dd*0.045);
+    float u = 1.0 - exp(-dist*(0.11 + dd*0.004));
+    c = mix(c*vec3(0.45,0.75,0.85)*(0.25+0.75*dark), vec3(0.01,0.15,0.24)*Lum*dark, u);
   }
   gl_FragColor = vec4(c, col.a);
 }";
@@ -2198,7 +2231,7 @@ precision highp float;
 varying vec3 wp; varying float depth;
 uniform sampler2D Detail;
 uniform vec3 CamPos; uniform vec3 SunDir; uniform vec3 SunCol; uniform float Time;
-uniform vec3 HorCol; uniform vec3 ZenCol; uniform float Lum; uniform float WQ;
+uniform vec3 HorCol; uniform vec3 ZenCol; uniform float Lum; uniform float WQ; uniform float FogK;
 {}
 float tn(vec2 p){{ return texture2D(Detail, p).r; }}
 vec3 skyc(vec3 r){{
@@ -2279,7 +2312,7 @@ void main(){{
   alpha = max(alpha, foam*0.92);
   alpha *= smoothstep(-0.06, 0.12, depth);
 
-  float fg = 1.0 - exp(-dist*dist*0.0000045);
+  float fg = 1.0 - exp(-dist*dist*0.0000045*FogK);
   col = mix(col, HorCol, fg);
   gl_FragColor = vec4(col, alpha);
 }}",
@@ -2664,7 +2697,7 @@ fn spawn_monsters(t: &Terrain) -> Vec<Swimmer> {
         let a = rf(0.0, TAU);
         let d = rf(70.0, 225.0);
         let (x, z) = (a.cos() * d, a.sin() * d);
-        if t.at(x, z) < -6.9 && t.at(x + 8.0, z) < -6.9 && t.at(x, z + 8.0) < -6.9 {
+        if t.at(x, z) < -12.0 && t.at(x + 8.0, z) < -12.0 && t.at(x, z + 8.0) < -12.0 {
             let sp = 11 + (v.len() % 3);
             let kg = rf(fish::SPECIES[sp].kg.0, fish::SPECIES[sp].kg.1);
             v.push(Swimmer {
@@ -2690,7 +2723,7 @@ fn fish_shape(mb: &mut MB, pos: Vec3, heading: f32, size: f32, col: Vec3, _wag: 
 }
 
 fn update_swimmer(f: &mut Swimmer, t: &Terrain, dt: f32) {
-    let (lo, hi) = if f.monster { (-30.0, -6.6) } else { (-6.8, -1.4) };
+    let (lo, hi) = if f.monster { (ABYSS - 5.0, -11.0) } else { (-6.8, -1.4) };
     f.heading += rf(-1.0, 1.0) * dt * if f.monster { 0.5 } else { 1.4 };
     let nx = f.pos.x + f.heading.cos() * f.speed * dt;
     let nz = f.pos.z + f.heading.sin() * f.speed * dt;

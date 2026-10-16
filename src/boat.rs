@@ -16,6 +16,8 @@ pub struct Boat {
     pub roll: f32,
     /// set while the engine is making power (for sound and the prop)
     pub engine: f32,
+    /// extra rolling after a hit (a swing that dies away)
+    pub rock: f32,
 }
 
 /// Height, pitch and roll of a boat floating at (x, z) heading `yaw`.
@@ -31,7 +33,7 @@ pub fn attitude(t: &Terrain, x: f32, z: f32, yaw: f32, time: f32) -> (f32, f32, 
 
 impl Boat {
     pub fn new(pos: Vec3, yaw: f32) -> Boat {
-        Boat { pos, yaw, speed: 0.0, turn: 0.0, row_t: 0.0, row_amt: 0.0, pitch: 0.0, roll: 0.0, engine: 0.0 }
+        Boat { pos, yaw, speed: 0.0, turn: 0.0, row_t: 0.0, row_amt: 0.0, pitch: 0.0, roll: 0.0, engine: 0.0, rock: 0.0 }
     }
 
     pub fn forward(&self) -> Vec3 {
@@ -45,15 +47,15 @@ impl Boat {
 
     /// `throttle` -1..1 (W/S), `steer` -1..1 (A/D, positive = right), `solid(x,z)` = can't float there.
     #[allow(clippy::too_many_arguments)]
-    pub fn update(&mut self, dt: f32, throttle: f32, steer: f32, boost: bool, motor: bool, t: &Terrain, time: f32, solid: &dyn Fn(f32, f32) -> bool) {
+    pub fn update(&mut self, dt: f32, throttle: f32, steer: f32, boost: bool, motor: bool, power: f32, t: &Terrain, time: f32, solid: &dyn Fn(f32, f32) -> bool) {
         let dt = dt.min(0.05);
         let working = throttle.abs() > 0.05;
         if motor {
             // outboard: strong steady push, much faster with boost
-            let acc = if boost { 7.0 } else { 4.2 };
+            let acc = (if boost { 7.0 } else { 4.2 }) * power;
             self.speed += throttle * acc * dt;
             self.speed -= self.speed * 0.45 * dt;
-            self.speed = self.speed.clamp(-3.0, if boost { 11.5 } else { 7.5 });
+            self.speed = self.speed.clamp(-3.0, (if boost { 11.5 } else { 7.5 }) * power);
             self.engine += ((if working || self.speed.abs() > 0.5 { 1.0 } else { 0.25 }) - self.engine) * (dt * 3.0).min(1.0);
             self.row_amt += (0.0 - self.row_amt) * (dt * 4.0).min(1.0);
         } else {
@@ -103,6 +105,7 @@ impl Boat {
         } else {
             self.speed *= -0.25;
         }
+        self.rock -= self.rock * (dt * 0.9).min(1.0);
         let (y, p, r) = attitude(t, self.pos.x, self.pos.z, self.yaw, time);
         self.pos.y = y;
         self.pitch += (p - self.pitch) * (dt * 4.0).min(1.0);

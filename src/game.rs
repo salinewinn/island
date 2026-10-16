@@ -1,11 +1,15 @@
 //! The game itself: title screen flow, hotbar items, shop, tent, save, multiplayer glue.
 
 use super::*;
-use crate::boat::{self, Boat, BoatView};
+use crate::boat::{self, BoatView};
 use crate::fish::{self, FishPose, SPECIES};
+use crate::horror::{self, Haunt, HauntEvent, SanityIn, StalkEvent, StalkIn, StalkerCtl};
+use crate::islands::{self, Good};
 use crate::items::*;
 use crate::net::{Mode as NetMode, Net, NetEvent, PlayerNet};
 use crate::people::*;
+use crate::postfx::{FxParams, PostFx};
+use crate::progress::{self, Progress};
 use crate::ui::*;
 use std::collections::VecDeque;
 
@@ -51,6 +55,41 @@ enum Screen {
     Pause(usize),
     Shop,
     Tent,
+    /// a trader on one of the other islands (index into `Islands::vendors`)
+    Vendor(usize),
+    /// reading a diary page
+    Page(usize),
+}
+
+/// A flare in the air or burning on the water: the night hunters keep away from it.
+struct Flare {
+    pos: Vec3,
+    vel: Vec3,
+    life: f32,
+}
+
+const FLARE_LIFE: f32 = 75.0;
+
+/// What the hermit's counter sells: the best rods, baits and the master reel come from the other islands.
+const HERMIT_RODS: usize = 4;
+const HERMIT_BAITS: usize = 5;
+const HERMIT_UPGRADES: usize = 3;
+
+/// Moves a flare one step: up and out, then it drifts down slowly under its little parachute and
+/// burns on the water or the ground.
+fn update_flare(f: &mut Flare, terrain: &Terrain, time: f32, dt: f32) {
+    f.life -= dt;
+    let surface = terrain.at(f.pos.x, f.pos.z).max(water_h(terrain, f.pos.x, f.pos.z, time));
+    if f.pos.y <= surface + 0.05 && f.vel.y <= 0.0 {
+        f.pos.y = surface + 0.05;
+        f.vel = Vec3::ZERO;
+        return;
+    }
+    f.vel.y = (f.vel.y - 9.0 * dt).max(-2.2);
+    let drag = (1.0 - 0.5 * dt).max(0.0);
+    f.vel.x *= drag;
+    f.vel.z *= drag;
+    f.pos += f.vel * dt;
 }
 
 static DBG_N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -130,6 +169,7 @@ fn item_name(k: ItemKind, rod_tier: usize, bait: usize, fish: Option<(usize, f32
         ItemKind::Lantern => "Lantern".into(),
         ItemKind::Bait => format!("Bait: {}", BAITS[bait.min(N_BAITS - 1)].0),
         ItemKind::Bucket => "Bucket".into(),
+        ItemKind::FlareGun => "Flare gun".into(),
         ItemKind::Fish => match fish {
             Some((f, kg)) if f == fish::BOOT => format!("{} (worth {} coins)", SPECIES[f].name, fish::fish_value(f, kg)),
             Some((f, kg)) => format!("{}  {:.1} kg  (worth {} coins)", SPECIES[f].name, kg, fish::fish_value(f, kg)),
@@ -147,11 +187,74 @@ fn add_coins(coins: &mut i32, nw: &mut Net, d: i32) {
 // ---------------------------------------------------------------------------
 // Save file (only written from the tent)
 // ---------------------------------------------------------------------------
-fn save_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("island_save.txt")))
-        .unwrap_or_else(|| std::path::PathBuf::from("island_save.txt"))
+/// How many save slots there are.
+pub const SLOTS: usize = 5;
+
+fn save_dir() -> std::path::PathBuf {
+    std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+fn save_path(slot: usize) -> std::path::PathBuf {
+    save_dir().join(format!("island_save_{}.txt", slot.min(SLOTS - 1) + 1))
+}
+
+/// The old single save file becomes slot 1.
+fn migrate_old_save() {
+    let old = save_dir().join("island_save.txt");
+    let first = save_path(0);
+    if old.exists() && !first.exists() {
+        let _ = std::fs::rename(&old, &first);
+    }
+}
+
+pub fn slot_exists(slot: usize) -> bool {
+    save_path(slot).exists()
+}
+
+pub fn delete_slot(slot: usize) {
+    let _ = std::fs::remove_file(save_path(slot));
+}
+
+/// What the slot picker shows for a save.
+pub struct SlotInfo {
+    pub coins: i32,
+    pub day: u32,
+    pub level: u32,
+    pub rod: &'static str,
+    pub saved: String,
+}
+
+fn ago(unix: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if unix == 0 || now < unix {
+        return "a while ago".into();
+    }
+    let s = now - unix;
+    match s {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", s / 60),
+        3600..=86_399 => format!("{} h ago", s / 3600),
+        _ => format!("{} days ago", s / 86_400),
+    }
+}
+
+pub fn slot_info(slot: usize) -> Option<SlotInfo> {
+    migrate_old_save();
+    let text = std::fs::read_to_string(save_path(slot)).ok()?;
+    let (mut coins, mut rod, mut sky_t, mut level, mut saved) = (50i32, 0usize, 330.0f32, 1u32, 0u64);
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim();
+        match k.trim() {
+            "coins" => coins = v.parse().unwrap_or(50),
+            "rod_tier" => rod = v.parse::<usize>().unwrap_or(0).min(N_RODS - 1),
+            "sky_t" => sky_t = v.parse().unwrap_or(330.0),
+            "level" => level = v.parse().unwrap_or(1),
+            "saved" => saved = v.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    Some(SlotInfo { coins, day: (sky_t.max(0.0) / CYCLE) as u32 + 1, level, rod: RODS[rod].0, saved: ago(saved) })
 }
 
 struct SaveData {
@@ -166,13 +269,14 @@ struct SaveData {
     lantern_on: bool,
     best: Option<(usize, f32)>,
     sky_t: f32,
-    upg: [bool; 3],
+    upg: [bool; N_UPG],
     has_key: bool,
+    pro: Progress,
 }
 
 impl SaveData {
-    fn load() -> Option<SaveData> {
-        let text = std::fs::read_to_string(save_path()).ok()?;
+    fn load(slot: usize) -> Option<SaveData> {
+        let text = std::fs::read_to_string(save_path(slot)).ok()?;
         let mut s = SaveData {
             coins: 50,
             rod_tier: 0,
@@ -185,8 +289,9 @@ impl SaveData {
             lantern_on: false,
             best: None,
             sky_t: 330.0,
-            upg: [false; 3],
+            upg: [false; N_UPG],
             has_key: false,
+            pro: Progress::default(),
         };
         let fish = |p: &str| -> Option<(usize, f32)> {
             let (a, b) = p.trim().split_once(':')?;
@@ -228,14 +333,16 @@ impl SaveData {
                 "coconuts" => s.coconuts = v.parse::<u32>().unwrap_or(0).min(999),
                 "lantern_on" => s.lantern_on = v == "1" || v == "true",
                 "upg" => {
-                    for (i, p) in v.split(',').take(3).enumerate() {
+                    for (i, p) in v.split(',').take(N_UPG).enumerate() {
                         s.upg[i] = p.trim() == "1";
                     }
                 }
                 "key" => s.has_key = v == "1" || v == "true",
                 "best" => s.best = fish(v),
                 "sky_t" => s.sky_t = v.parse::<f32>().ok().filter(|t| t.is_finite()).unwrap_or(330.0),
-                _ => {}
+                _ => {
+                    s.pro.read(k, v);
+                }
             }
         }
         // a fish item needs its fish, and a fish needs its item
@@ -250,7 +357,7 @@ impl SaveData {
         Some(s)
     }
 
-    fn write(&self) -> bool {
+    fn write(&self, slot: usize) -> bool {
         let mut t = String::new();
         let b = |x: bool| if x { "1" } else { "0" };
         t += &format!("coins={}\nrod_tier={}\n", self.coins, self.rod_tier);
@@ -262,12 +369,16 @@ impl SaveData {
         t += &format!("fish={}\n", fs.join(","));
         let bs: Vec<String> = self.baits.iter().map(|n| n.to_string()).collect();
         t += &format!("baits={}\nbait_sel={}\ncoconuts={}\nlantern_on={}\n", bs.join(","), self.bait_sel, self.coconuts, b(self.lantern_on));
-        t += &format!("upg={},{},{}\nkey={}\n", b(self.upg[0]), b(self.upg[1]), b(self.upg[2]), b(self.has_key));
+        let up: Vec<&str> = self.upg.iter().map(|x| b(*x)).collect();
+        t += &format!("upg={}\nkey={}\nlevel={}\n", up.join(","), b(self.has_key), self.pro.level());
+        t += &self.pro.write();
         if let Some((f, kg)) = self.best {
             t += &format!("best={}:{:.2}\n", f, kg);
         }
         t += &format!("sky_t={:.1}\n", self.sky_t);
-        std::fs::write(save_path(), t).is_ok()
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        t += &format!("saved={}\n", unix);
+        std::fs::write(save_path(slot), t).is_ok()
     }
 }
 // ---------------------------------------------------------------------------
@@ -297,6 +408,128 @@ fn shop_row(ui: &mut Ui, x: f32, y: f32, w: f32, name: &str, desc: &str, btn: &s
     ui.text(name, x, y, 22.0, WHITE);
     ui.text(desc, x, y + 26.0, 17.0, Color::new(0.7, 0.75, 0.8, 1.0));
     ui.button(x + w - 130.0, y, 130.0, 46.0, btn, on, accent)
+}
+
+/// Where one line of a trader's stock stands for this player.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum GoodState {
+    /// can be bought (if there is enough money)
+    Buy,
+    /// already have it
+    Owned,
+    /// a rod you own: `true` = it is the one in your hands
+    Equip(bool),
+    /// can't be bought yet, and why
+    Locked(&'static str),
+}
+
+struct GoodRow {
+    name: String,
+    desc: String,
+    price: i32,
+    state: GoodState,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn good_row(g: Good, pro: &Progress, owned_rods: &[bool; N_RODS], rod_tier: usize, upg: &[bool; N_UPG], baits: &[u32; N_BAITS], has_key: bool, hotbar: &Hotbar) -> GoodRow {
+    match g {
+        Good::Rod(i) => {
+            let r = RODS[i];
+            let desc = format!("Cast +{:.0}%  Reel +{:.0}%  Line strength x{:.1}  Better fish", (r.1 - 1.0) * 100.0, (r.2 - 1.0) * 100.0, r.8);
+            let state = if owned_rods[i] {
+                GoodState::Equip(rod_tier == i)
+            } else if !hb_can_give(hotbar, ItemKind::Rod) {
+                GoodState::Locked("hotbar full")
+            } else {
+                GoodState::Buy
+            };
+            GoodRow { name: r.0.to_string(), desc, price: r.5, state }
+        }
+        Good::Bait(i) => {
+            let b = BAITS[i];
+            let state = if hb_can_give(hotbar, ItemKind::Bait) { GoodState::Buy } else { GoodState::Locked("hotbar full") };
+            GoodRow { name: format!("{}  (you have {})", b.0, baits[i]), desc: format!("Pack of {}   Luck +{:.0}%   Faster bites", b.4, b.1 * 100.0), price: b.3, state }
+        }
+        Good::Upgrade(i) => {
+            let (name, desc, price) = UPGRADES[i];
+            GoodRow { name: name.to_string(), desc: desc.to_string(), price, state: if upg[i] { GoodState::Owned } else { GoodState::Buy } }
+        }
+        Good::Boat(i) => {
+            let (name, desc, price) = progress::BOAT_UPGRADES[i];
+            let state = match pro.can_buy(i, has_key) {
+                Ok(()) => GoodState::Buy,
+                Err("Owned") => GoodState::Owned,
+                Err(why) => GoodState::Locked(why),
+            };
+            GoodRow { name: name.to_string(), desc: desc.to_string(), price, state }
+        }
+        Good::Gas => {
+            let tank = pro.tank_size();
+            let state = if !(has_key && pro.boat[progress::ENGINE]) {
+                GoodState::Locked("you need an engine first")
+            } else if pro.fuel >= tank - 1.0 {
+                GoodState::Locked("tank is full")
+            } else {
+                GoodState::Buy
+            };
+            GoodRow { name: "Gasoline".into(), desc: format!("Fills the tank ({:.0}/{:.0})", pro.fuel, tank), price: progress::GAS_PRICE, state }
+        }
+        Good::Flares => GoodRow { name: format!("Flares x{}  (you have {})", progress::FLARE_PACK.0, pro.flares), desc: "Burn for over a minute. The hunters keep away from the light.".into(), price: progress::FLARE_PACK.1, state: GoodState::Buy },
+        Good::FlareGun => {
+            let state = if hb_has(hotbar, ItemKind::FlareGun) {
+                GoodState::Owned
+            } else if !hb_can_give(hotbar, ItemKind::FlareGun) {
+                GoodState::Locked("hotbar full")
+            } else {
+                GoodState::Buy
+            };
+            GoodRow { name: "Flare gun".into(), desc: "Fires a flare high over the water.".into(), price: progress::FLARE_GUN_PRICE, state }
+        }
+        Good::Repair => GoodRow {
+            name: "Hull repair".into(),
+            desc: format!("Hull at {:.0}%", pro.hp),
+            price: progress::REPAIR_PRICE,
+            state: if pro.hp >= 99.0 { GoodState::Locked("no damage") } else { GoodState::Buy },
+        },
+    }
+}
+
+/// The journal tab of the pause menu: level, the fish you have caught and the diary pages you found.
+/// Returns the page to read when one is clicked.
+fn tab_journal(ui: &mut Ui, pro: &Progress, x: f32, w: f32) -> Option<usize> {
+    let dim = Color::new(0.65, 0.7, 0.75, 1.0);
+    ui.text("Journal", x, 80.0, 30.0, WHITE);
+    let lv = pro.level();
+    ui.text(&format!("Angler level {}   -   {} XP", lv, pro.xp), x, 126.0, 22.0, Color::new(0.7, 0.88, 1.0, 1.0));
+    ui.rect(x, 156.0, w, 10.0, Color::new(0.0, 0.0, 0.0, 0.5));
+    ui.rect(x, 156.0, w * progress::level_progress(pro.xp), 10.0, Color::new(0.45, 0.75, 1.0, 1.0));
+    let (luck, reel) = progress::level_perks(lv);
+    ui.text(&format!("Perks: +{:.0}% luck, +{:.1}% reel power", luck * 100.0, (reel - 1.0) * 100.0), x, 174.0, 16.0, dim);
+    ui.text(&format!("Fish caught: {} of {} kinds", pro.species_caught(), fish::N_SPECIES), x, 206.0, 22.0, WHITE);
+    let half = fish::N_SPECIES.div_ceil(2);
+    for i in 0..fish::N_SPECIES {
+        let (col, row) = (i / half, i % half);
+        let (fx, fy) = (x + col as f32 * (w * 0.5), 238.0 + row as f32 * 24.0);
+        let (n, kg) = pro.journal[i];
+        if n > 0 {
+            ui.text(&format!("{}  x{}  best {:.1} kg", SPECIES[i].name, n, kg), fx, fy, 18.0, Color::new(0.9, 0.95, 1.0, 1.0));
+        } else {
+            ui.text("??? not caught yet", fx, fy, 18.0, Color::new(1.0, 1.0, 1.0, 0.3));
+        }
+    }
+    let py = 238.0 + half as f32 * 24.0 + 20.0;
+    ui.text(&format!("Diary pages: {} of {}", pro.pages_found(), progress::N_PAGES), x, py, 22.0, WHITE);
+    let mut open = None;
+    for i in 0..progress::N_PAGES {
+        let (col, row) = (i % 4, i / 4);
+        let (bx, by) = (x + col as f32 * (w / 4.0), py + 32.0 + row as f32 * 44.0);
+        let found = pro.has_page(i);
+        let label = if found { format!("Page {}", i + 1) } else { "?".to_string() };
+        if ui.button(bx, by, w / 4.0 - 8.0, 38.0, &label, found, false) {
+            open = Some(i);
+        }
+    }
+    open
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +585,7 @@ async fn session(first: bool) -> bool {
                 UniformDesc::new("Under", UniformType::Float1),
                 UniformDesc::new("Lum", UniformType::Float1),
                 UniformDesc::new("Bump", UniformType::Float1),
+                UniformDesc::new("FogK", UniformType::Float1),
                 UniformDesc::new("SunDir", UniformType::Float3),
                 UniformDesc::new("SunCol", UniformType::Float3),
                 UniformDesc::new("AmbCol", UniformType::Float3),
@@ -393,6 +627,7 @@ async fn session(first: bool) -> bool {
                 UniformDesc::new("ZenCol", UniformType::Float3),
                 UniformDesc::new("Lum", UniformType::Float1),
                 UniformDesc::new("WQ", UniformType::Float1),
+                UniformDesc::new("FogK", UniformType::Float1),
                 UniformDesc::new("Time", UniformType::Float1),
             ],
             textures: vec!["Detail".to_owned()],
@@ -403,11 +638,11 @@ async fn session(first: bool) -> bool {
 
     let mut ui = Ui::new();
     let mut look = Look::decode(&st.look).unwrap_or_else(|| Look::default_for(0));
-    let has_save = save_path().exists();
+    migrate_old_save();
     let choice = if has_arg("--skipmenu") && first {
-        MenuChoice { new_game: false, launch: Launch::Solo }
+        MenuChoice { new_game: false, launch: Launch::Solo, slot: st.slot }
     } else {
-        let c = main_menu(&mut ui, &mut st, &mut look, has_save, &world_mat).await;
+        let c = main_menu(&mut ui, &mut st, &mut look, &world_mat).await;
         st.look = look.encode();
         st.save();
         c
@@ -422,7 +657,10 @@ async fn session(first: bool) -> bool {
             launch = Launch::Join(c.clone());
         }
     }
-    let save: Option<SaveData> = if new_game { None } else { SaveData::load() };
+    let save_slot = choice.slot.min(SLOTS - 1);
+    st.slot = save_slot;
+    st.save();
+    let save: Option<SaveData> = if new_game { None } else { SaveData::load(save_slot) };
 
     // ---- build the world, one labelled step at a time ----
     DETAIL.with(|d| d.set(detail_mult(st.detail)));
@@ -459,6 +697,9 @@ async fn session(first: bool) -> bool {
     for t in &sc.trunks {
         cols.push(Col::Circle { c: *t, r: 0.42, y0: -20.0, top: 1.0e9, walk: false });
     }
+    step!(0.6, "Settling the other islands...");
+    let isl = islands::build_islands(&mut pool, &terrain, plaza.tent_pos);
+    cols.extend(isl.cols.iter().cloned());
     let cells = finish(pool);
     step!(0.68, "Filling the sea...");
     let water = build_water(&terrain);
@@ -533,7 +774,8 @@ async fn session(first: bool) -> bool {
     let mut held = 0u32; // coconuts
     let mut lantern_on = false;
     let mut best: Option<(usize, f32)> = None;
-    let mut upg = [false; 3]; // braided line, steel leader, pro reel
+    let mut upg = [false; N_UPG]; // braided line, steel leader, pro reel, master reel
+    let mut pro = Progress::default();
     let mut has_key = false; // the boat key (found inside the first deep-water monster you land)
     let mut sky_start = argf("--time", 1).unwrap_or(330.0);
     let continuing = save.is_some();
@@ -550,6 +792,7 @@ async fn session(first: bool) -> bool {
         best = s.best;
         upg = s.upg;
         has_key = s.has_key;
+        pro = s.pro;
         if argf("--time", 1).is_none() {
             sky_start = s.sky_t;
         }
@@ -562,9 +805,9 @@ async fn session(first: bool) -> bool {
     }
     if has_arg("--kit") {
         coins = 500;
-        owned_rods = [true, true, true, true];
+        owned_rods = [true; N_RODS];
         rod_tier = 3;
-        baits = [8, 4, 3, 3, 3];
+        baits = [8, 4, 3, 3, 3, 2, 1];
         held = 3;
         lantern_on = true;
         has_key = has_arg("--key");
@@ -574,6 +817,15 @@ async fn session(first: bool) -> bool {
         if has_arg("--fish") {
             hotbar[4] = Some(ItemKind::Fish);
             fish_slots[4] = Some((2, 2.2));
+        }
+        if has_arg("--flares") {
+            hb_give(&mut hotbar, ItemKind::FlareGun);
+            pro.flares = 5;
+        }
+        if has_arg("--boatkit") {
+            has_key = true;
+            pro.boat = [true; progress::N_BOAT_UPG];
+            pro.fuel = pro.tank_size();
         }
     }
 
@@ -624,6 +876,13 @@ async fn session(first: bool) -> bool {
     if has_arg("--shop") {
         look_at_target(&mut feet, &mut yaw, &mut pitch, npc_pos + Vec3::Y * 1.2, 2.6);
     }
+    // debug: --vendor N stands in front of trader N, --page N next to diary page N
+    if let Some(v) = argf("--vendor", 1).and_then(|i| isl.vendors.get(i as usize)) {
+        look_at_target(&mut feet, &mut yaw, &mut pitch, v.person + Vec3::Y * 1.2, 2.8);
+    }
+    if let Some(p) = argf("--page", 1).and_then(|i| isl.pages.iter().find(|p| p.id == i as usize)) {
+        look_at_target(&mut feet, &mut yaw, &mut pitch, p.pos, 1.6);
+    }
     if has_arg("--tent") {
         look_at_target(&mut feet, &mut yaw, &mut pitch, plaza.tent_pos + Vec3::Y * 0.9, 3.0);
     }
@@ -668,6 +927,9 @@ async fn session(first: bool) -> bool {
     let mut riding = false;
     let mut board_once = has_arg("--board");
     let mut frame_no = 0u32;
+    let lockview = has_arg("--lockview"); // debug: ignore the mouse (for screenshots)
+    // debug: --weather FOG BLOOD forces fog / blood-moon strength (0..1)
+    let dbg_weather: Option<(f32, f32)> = args.iter().position(|a| a == "--weather").map(|i| (args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(0.0), args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(0.0)));
     let autopull = has_arg("--autopull");
     let mut leave: Option<bool> = None; // Some(true) = back to the main menu, Some(false) = quit to the desktop
     let mut shop_tab = 0usize;
@@ -690,6 +952,21 @@ async fn session(first: bool) -> bool {
     } else {
         toasts.push_back(("Visit the hermit's camp to buy a rod and bait, then head down the path to the dock.".into(), 9.0));
     }
+    // ---- the horror layer ----
+    let mut sanity = argf("--sanity", 1).unwrap_or(100.0).clamp(0.0, 100.0);
+    let mut dread = 0.0f32; // smoothed fear 0..1 (drives the screen effects and the heartbeat)
+    let mut pulse = 0.0f32; // flashes to 1 on each heartbeat
+    let mut heart_t = 0.0f32;
+    let mut glitch = 0.0f32; // jump-scare signal trouble, fades out
+    let mut hurt = 0.0f32; // red flash after being hit, fades out
+    let mut haunt = Haunt::new();
+    let mut stalkers = StalkerCtl::default();
+    let mut warned_stalkers = false;
+    let mut flares: Vec<Flare> = vec![];
+    let mut search_on = false;
+    let mut postfx = PostFx::new();
+    let mut vendor_msg = String::new();
+    let mut last_level = pro.level();
     let mut shop_msg = String::from("Haven't had company in a long while. Got fish? I've got gear.");
     let mut tent_msg = String::new();
     let mut dusk_hint = false;
@@ -702,6 +979,11 @@ async fn session(first: bool) -> bool {
         Screen::Pause(m as usize)
     } else if has_arg("--shopui") {
         Screen::Shop
+    } else if let Some(i) = argf("--vendorui", 1).filter(|i| (*i as usize) < isl.vendors.len()) {
+        vendor_msg = isl.vendors[i as usize].greeting.to_string();
+        Screen::Vendor(i as usize)
+    } else if let Some(i) = argf("--pageui", 1) {
+        Screen::Page((i as usize).min(progress::N_PAGES - 1))
     } else if has_arg("--tentui") {
         Screen::Tent
     } else {
@@ -782,6 +1064,9 @@ async fn session(first: bool) -> bool {
             let nt = t + dt;
             if t < 0.6 && nt >= 0.6 {
                 clock_base = target - time;
+                sanity = (sanity + 60.0).min(100.0);
+                stalkers.list.clear();
+                stalkers.threat = 0.0;
                 let msg = if target < DAY_LEN * 0.5 { "You slept until morning. Good morning!" } else { "You slept until night." };
                 toasts.push_back((msg.into(), 4.0));
             }
@@ -793,7 +1078,15 @@ async fn session(first: bool) -> bool {
             Some((t0, at)) if nw.mode == NetMode::Client => t0 + (time - at),
             _ => clock_base + time,
         };
-        let sky = sky_at(sky_t);
+        let weather = {
+            let w = horror::weather_at(sky_t);
+            match dbg_weather {
+                Some((f, b)) => horror::Weather { fog: f, blood: b, night: w.night.max(if b > 0.0 || f > 0.0 { 1.0 } else { 0.0 }), day: w.day },
+                None => w,
+            }
+        };
+        let mut sky = sky_at(sky_t);
+        horror::apply_weather(&mut sky, &weather);
 
         // ---------- network ----------
         for e in nw.poll() {
@@ -946,7 +1239,7 @@ async fn session(first: bool) -> bool {
         let fighting = matches!(fs, FS::Bite { .. } | FS::Reeling(_));
         let holding = matches!(fs, FS::Holding { .. });
 
-        let md = mouse_delta_position();
+        let md = if lockview { Vec2::ZERO } else { mouse_delta_position() };
         if grabbed && !fighting {
             if skip_mouse > 0 {
                 skip_mouse -= 1;
@@ -1052,16 +1345,27 @@ async fn session(first: bool) -> bool {
             swim = false;
         }
 
+        let has_engine = has_key && pro.boat[progress::ENGINE];
         let mut moving = false;
         let prev_feet = feet;
         if !riding {
             // an empty boat just floats where you left it
-            boat.update(dt, 0.0, 0.0, false, has_key, &terrain, time, &|x, z| terrain.at(x, z) > -0.8 || dock.near(x, z, 1.1));
+            boat.update(dt, 0.0, 0.0, false, false, 1.0, &terrain, time, &|x, z| terrain.at(x, z) > -0.8 || dock.near(x, z, 1.1));
         }
         if riding {
             let throttle = key_f as f32;
             let steer = key_r as f32;
-            boat.update(dt, throttle, steer, sprint, has_key, &terrain, time, &|x, z| terrain.at(x, z) > -0.8 || dock.near(x, z, 1.1));
+            let motor_ok = has_engine && pro.fuel > 0.0;
+            // a battered hull limps along: the motor loses up to 40% of its push
+            let power = (if pro.boat[progress::TURBO] { 1.6 } else { 1.0 }) * (0.6 + 0.4 * pro.hp / 100.0);
+            boat.update(dt, throttle, steer, sprint, motor_ok, power, &terrain, time, &|x, z| terrain.at(x, z) > -0.8 || dock.near(x, z, 1.1));
+            if motor_ok {
+                // the outboard burns gasoline
+                pro.fuel = (pro.fuel - dt * (0.04 + 0.16 * throttle.abs()) * if sprint { 2.0 } else { 1.0 }).max(0.0);
+                if pro.fuel <= 0.0 {
+                    toasts.push_back(("The engine coughs and dies - out of gasoline! Paddle, or buy more.".into(), 5.0));
+                }
+            }
             feet = boat.seat();
             vy = 0.0;
             grounded = true;
@@ -1135,7 +1439,7 @@ async fn session(first: bool) -> bool {
         let walk_speed = if dt > 0.0 { (vec2(feet.x - prev_feet.x, feet.z - prev_feet.z).length() / dt).min(9.0) } else { 0.0 };
 
         // ---------- camera ----------
-        let bob = if moving && grounded && !riding { bob_t.sin() * 0.04 } else { 0.0 };
+        let bob = if moving && grounded && !riding { bob_t.sin() * 0.04 } else { 0.0 } + boat.rock * (time * 31.0).sin() * 0.03;
         let eye = feet + Vec3::Y * (if riding { 1.22 } else { 1.7 } + bob);
         let eye_wy = water_h(&terrain, eye.x, eye.z, time);
         let under = eye.y < eye_wy - 0.02 && terrain.at(eye.x, eye.z) < eye.y;
@@ -1191,6 +1495,20 @@ async fn session(first: bool) -> bool {
             let to = (plaza.tent_pos + Vec3::Y * 0.8 - eye).normalize_or_zero();
             to.dot(fwd) > 0.7
         };
+        // the traders on the other islands and the diary pages lying around
+        let mut vendor_target: Option<usize> = None;
+        for (i, v) in isl.vendors.iter().enumerate() {
+            if vec2(feet.x - v.person.x, feet.z - v.person.z).length() < 3.8 && (v.person + Vec3::Y * 1.2 - eye).normalize_or_zero().dot(fwd) > 0.7 {
+                vendor_target = Some(i);
+            }
+        }
+        let mut page_target: Option<usize> = None;
+        for (i, p) in isl.pages.iter().enumerate() {
+            let to = p.pos - eye;
+            if to.length() < 2.8 && to.normalize_or_zero().dot(fwd) > 0.78 {
+                page_target = Some(i);
+            }
+        }
         let boat_dist = vec2(feet.x - boat.pos.x, feet.z - boat.pos.z).length();
         let boat_target = !riding && boat_dist < 3.8 && {
             let to = (boat.pos + Vec3::Y * 0.3 - eye).normalize_or_zero();
@@ -1240,13 +1558,32 @@ async fn session(first: bool) -> bool {
                 grounded = true;
                 fs = FS::Idle;
                 sfx.play(crate::audio::Snd::Thump, 0.8);
-                toasts.push_back((format!("W/S row, A/D steer{}", if has_key { ", Shift = full throttle" } else { "" }), 4.0));
+                toasts.push_back((format!("W/S row, A/D steer{}", if has_engine { ", Shift = full throttle" } else { "" }), 4.0));
             } else if npc_target {
                 screen = Screen::Shop;
                 shop_msg = "Haven't had company in a long while. Got fish? I've got gear.".into();
             } else if tent_target {
                 screen = Screen::Tent;
                 tent_msg.clear();
+            } else if let Some(i) = vendor_target {
+                let v = &isl.vendors[i];
+                vendor_msg = if weather.night > 0.5 { v.night_line } else { v.greeting }.to_string();
+                screen = Screen::Vendor(i);
+            } else if let Some(i) = page_target {
+                let id = isl.pages[i].id;
+                if !pro.has_page(id) {
+                    pro.pages |= 1 << id;
+                    sanity = (sanity - 4.0).max(0.0);
+                    sfx.play(crate::audio::Snd::Pop, 1.0);
+                    toasts.push_back((format!("You found a diary page ({} of {})", pro.pages_found(), progress::N_PAGES), 4.0));
+                    if pro.pages_found() as usize == progress::N_PAGES {
+                        add_coins(&mut coins, &mut nw, 2500);
+                        pro.xp += 500;
+                        sfx.play(crate::audio::Snd::Coins, 1.0);
+                        toasts.push_back(("That's all of them. Whoever left these also left a purse of coins under the last page (+2500).".into(), 8.0));
+                    }
+                }
+                screen = Screen::Page(id);
             } else if let Some(i) = coco_target {
                 if !hb_can_give(&hotbar, ItemKind::Coconut) {
                     toasts.push_back(("Your hotbar is full - free a slot first".into(), 3.0));
@@ -1290,6 +1627,20 @@ async fn session(first: bool) -> bool {
             lantern_on = !lantern_on;
             sfx.play(crate::audio::Snd::Lantern, 1.0);
         }
+        if !in_menu_now && sel == Some(ItemKind::FlareGun) && st.pressed(Act::Use) {
+            if pro.flares > 0 {
+                pro.flares -= 1;
+                flares.push(Flare { pos: eye + fwd * 0.7, vel: fwd * 24.0 + Vec3::Y * 15.0, life: FLARE_LIFE });
+                sfx.play(crate::audio::Snd::FlareShot, 1.0);
+                toasts.push_back((format!("Flare fired - the hunters keep away from it ({} left)", pro.flares), 3.0));
+            } else {
+                toasts.push_back(("Click... you're out of flares. The traders sell them.".into(), 3.0));
+            }
+        }
+        if !in_menu_now && riding && pro.boat[progress::SEARCHLIGHT] && sel != Some(ItemKind::Coconut) && st.pressed(Act::Drink) {
+            search_on = !search_on;
+            sfx.play(crate::audio::Snd::Lantern, 1.0);
+        }
         if !in_menu_now && sel == Some(ItemKind::Bait) && st.pressed(Act::Use) {
             // cycle through the baits you own
             for k in 1..=N_BAITS {
@@ -1315,6 +1666,10 @@ async fn session(first: bool) -> bool {
                 update_coconut(c, &terrain, &dock, time, dt);
             }
         }
+        for f in flares.iter_mut() {
+            update_flare(f, &terrain, time, dt);
+        }
+        flares.retain(|f| f.life > 0.0);
 
         // ---------- fishing ----------
         let rod = RODS[rod_tier];
@@ -1322,7 +1677,8 @@ async fn session(first: bool) -> bool {
         let bait_bite = if baits[bait_sel] > 0 { BAITS[bait_sel].2 } else { 1.5 };
         // how much force the line takes, and how strongly the reel pulls
         let line_cap = 10.0 * rod.8 * if upg[0] { 1.25 } else { 1.0 } * if upg[1] { 1.6 } else { 1.0 };
-        let reel_pow = rod.2 * if upg[2] { 1.25 } else { 1.0 };
+        let (lvl_luck, lvl_reel) = progress::level_perks(pro.level());
+        let reel_pow = rod.2 * if upg[2] { 1.25 } else { 1.0 } * if upg[3] { 1.25 } else { 1.0 } * lvl_reel;
         let mut bend = 0.025f32;
         let mut lure: Option<Vec3> = None;
         let mut bobber: Option<Vec3> = None;
@@ -1437,9 +1793,15 @@ async fn session(first: bool) -> bool {
                     lure = Some(bp);
                     bobber = Some(bp);
                     bend = 0.07 + (time * 22.0).sin().abs() * 0.03;
-                    if use_pressed || -md.y > 0.03 {
+                    if (use_pressed || -md.y > 0.03) && rf(0.0, 1.0) < horror::phantom_chance(sanity) {
+                        // a bite that was only in your head
+                        fs = FS::Idle;
+                        sanity = (sanity - 3.0).max(0.0);
+                        sfx.play(crate::audio::Snd::Creak, 0.7);
+                        toasts.push_back(("There is nothing on the line. Was there ever?".into(), 3.5));
+                    } else if use_pressed || -md.y > 0.03 {
                         let deep = terrain.at(target.x, target.z) < -5.5;
-                        let (fish_i, kg) = fish::pick_fish(rod.3 + bait_luck + 0.5 * q, deep);
+                        let (fish_i, kg) = fish::pick_fish(rod.3 + bait_luck + lvl_luck + 0.5 * q, deep);
                         fs = FS::Reeling(Fight::new(fish_i, kg, target, q));
                         sfx.play(crate::audio::Snd::Thrash, 0.8);
                         if fish::is_monster(fish_i) {
@@ -1516,11 +1878,19 @@ async fn session(first: bool) -> bool {
                             if nw.mode != NetMode::Off {
                                 nw.send_msg(&txt);
                             }
+                            // experience and the fish journal
+                            let (gain, first) = pro.record_catch(f.fish, f.kg, fish::fish_value(f.fish, f.kg), fish::is_monster(f.fish));
+                            toasts.push_back((format!("+{} XP{}", gain, if first { "  -  new species in your journal!" } else { "" }), 3.5));
+                            if pro.level() > last_level {
+                                last_level = pro.level();
+                                sfx.play(crate::audio::Snd::Chime, 1.0);
+                                toasts.push_back((format!("Level up! You are a level {} angler - lines pull a little harder, fish bite a little better.", last_level), 6.0));
+                            }
                             // the first deep-water monster you land has the boat key in its jaws
                             if fish::is_monster(f.fish) && !has_key {
                                 has_key = true;
                                 sfx.play(crate::audio::Snd::Key, 1.0);
-                                toasts.push_back(("Something glints in its jaws... an old BOAT KEY! Your boat has an engine now.".into(), 8.0));
+                                toasts.push_back(("Something glints in its jaws... an old BOAT KEY! It fits an outboard - the boat yard on the east island sells engines.".into(), 9.0));
                             }
                             fs = FS::Holding { t: 0.0, fish: f.fish, kg: f.kg };
                             toasts.push_back((
@@ -1598,7 +1968,7 @@ async fn session(first: bool) -> bool {
                     speed: walk_speed,
                     boat: boat.pos.to_array(),
                     byaw: boat.yaw,
-                    bstate: if riding { if has_key { 3 } else { 2 } } else { 1 },
+                    bstate: if riding { if has_engine { 3 } else { 2 } } else { 1 },
                 });
             }
             if nw.mode == NetMode::Host && time_t > 1.0 {
@@ -1635,8 +2005,95 @@ async fn session(first: bool) -> bool {
             dusk_hint = false;
         }
 
+        // ---------- the horror layer: sanity, hunters, hallucinations ----------
+        let lit_boat = riding && pro.boat[progress::SEARCHLIGHT] && search_on;
+        let exposed = swim || riding;
+        let on_dock_now = dock.contains(feet.x, feet.z) && feet.y >= dock.deck_y - 0.3;
+        let by_water = !exposed && (on_dock_now || terrain.at(feet.x, feet.z) < 1.2);
+        let stalker_d = stalkers.nearest(feet);
+        if !freeze && intro.is_none() && sleep.is_none() {
+            let near_fire = vec2(feet.x - plaza.fire_pos.x, feet.z - plaza.fire_pos.z).length() < 9.0 || flares.iter().any(|f| f.pos.distance(feet) < 28.0);
+            let company = remotes.iter().flatten().any(|r| r.pos.distance(feet) < 18.0);
+            let deep = exposed && terrain.at(feet.x, feet.z) < -3.0;
+            sanity = horror::sanity_step(sanity, &SanityIn { dt, night: weather.night, fog: weather.fog, blood: weather.blood, deep, stalker_dist: stalker_d, lit: lit_now || lit_boat, near_fire, day_f: sky.day_f, company });
+            let flare_pos: Vec<Vec3> = flares.iter().map(|f| f.pos).collect();
+            let light = if lit_boat { Some((boat.pos + Vec3::Y, boat.forward())) } else { None };
+            let depth = |x: f32, z: f32| terrain.at(x, z);
+            let events = stalkers.update(&depth, &StalkIn { dt, time, player: feet, exposed, near_water: by_water, night: weather.night, blood: weather.blood, fog: weather.fog, flares: &flare_pos, light });
+            for e in events {
+                match e {
+                    StalkEvent::Spawned => {
+                        if !warned_stalkers {
+                            warned_stalkers = true;
+                            sfx.play(crate::audio::Snd::Bloop, 1.0);
+                            toasts.push_back(("Something enormous is circling out there in the dark water...".into(), 6.0));
+                        }
+                    }
+                    StalkEvent::Lunge(_) => {
+                        sfx.play(crate::audio::Snd::Scare, 1.0);
+                        sfx.play(crate::audio::Snd::Splash, 1.0);
+                        glitch = 1.0;
+                        hurt = 0.4;
+                        sanity = (sanity - 18.0).max(0.0);
+                    }
+                    StalkEvent::Hit { boat: in_boat } => {
+                        sfx.play(crate::audio::Snd::Crash, 1.0);
+                        glitch = 1.0;
+                        hurt = 1.0;
+                        if in_boat && riding {
+                            pro.hp -= 34.0 * pro.hull_factor();
+                            boat.rock = 1.0;
+                            boat.speed *= 0.3;
+                            sanity = (sanity - 12.0).max(0.0);
+                            if pro.hp <= 0.0 {
+                                // the boat is smashed: it drifts back to the dock, you are in the water
+                                pro.hp = 25.0;
+                                riding = false;
+                                boat = boat::start_boat(&terrain, &dock);
+                                feet = vec3(feet.x, water_h(&terrain, feet.x, feet.z, time) - 1.4, feet.z);
+                                swim = true;
+                                swim_vel = Vec3::ZERO;
+                                vy = 0.0;
+                                grounded = false;
+                                fs = FS::Idle;
+                                toasts.push_back(("The boat is SMASHED! The wreck washes back to the dock - swim for it!".into(), 7.0));
+                            } else {
+                                toasts.push_back((format!("Something rams the boat! Hull at {:.0}%", pro.hp.max(1.0)), 4.0));
+                            }
+                        } else {
+                            sanity = (sanity - 28.0).max(0.0);
+                            swim_vel += -fwd_flat * 4.0 + Vec3::Y * 1.0;
+                            toasts.push_back(("Something slams into you from below!".into(), 4.0));
+                        }
+                    }
+                }
+            }
+            if stalkers.list.is_empty() {
+                warned_stalkers = false;
+            }
+            for e in haunt.update(dt, sanity, feet, yaw, exposed || by_water, &|x, z| terrain.at(x, z)) {
+                if e == HauntEvent::ShadowAppeared {
+                    sfx.play(crate::audio::Snd::Creak, 0.6);
+                }
+            }
+        }
+        let dread_t = horror::dread_target(stalker_d, weather.night, sanity, weather.blood);
+        dread += (dread_t - dread) * (1.0 - (-dt * if dread_t > dread { 1.6 } else { 0.35 }).exp());
+        pulse = (pulse - dt * 3.5).max(0.0);
+        glitch = (glitch - dt * 0.9).max(0.0);
+        hurt = (hurt - dt * 0.8).max(0.0);
+        heart_t -= dt;
+        if dread > 0.28 && heart_t <= 0.0 {
+            heart_t = 1.25 - 0.7 * dread;
+            pulse = 1.0;
+            sfx.play(crate::audio::Snd::Heartbeat, 0.35 + 0.65 * dread);
+        }
+
         // ---------- render ----------
-        clear_background(Color::new(0.04 * sky.lum, 0.22 * sky.lum, 0.40 * sky.lum, 1.0));
+        let calm = (sanity / 60.0).clamp(0.0, 1.0);
+        let fx_glitch = glitch.max(if sanity < 30.0 { (30.0 - sanity) / 30.0 * 0.25 * (0.5 + 0.5 * (time * 0.9).sin()) } else { 0.0 });
+        let fx_on = postfx.is_some() && (st.camcorder || dread > 0.04 || calm < 0.98 || fx_glitch > 0.01 || hurt > 0.01);
+        let fx_target = if fx_on { postfx.as_mut().map(|p| p.target()) } else { None };
         let cam = Camera3D {
             position: eye,
             target: eye + fwd,
@@ -1644,9 +2101,11 @@ async fn session(first: bool) -> bool {
             fovy: st.fov.to_radians(),
             z_near: 0.03,
             z_far: 9000.0,
+            render_target: fx_target,
             ..Default::default()
         };
         set_camera(&cam);
+        clear_background(Color::new(0.04 * sky.lum, 0.22 * sky.lum, 0.40 * sky.lum, 1.0));
 
         draw_sky(eye, &sky);
         draw_stars(eye, &sky, &stars);
@@ -1655,23 +2114,31 @@ async fn session(first: bool) -> bool {
             draw_sphere(eye + sky.sun_dir * 5000.0, 140.0, None, col3(sc_col));
         }
         if sky.moon_el > -0.15 {
-            draw_sphere(eye + sky.moon_dir * 5000.0, 115.0, None, Color::new(0.92, 0.95, 1.0, 1.0));
+            let mc = vec3(0.92, 0.95, 1.0).lerp(vec3(0.95, 0.08, 0.06), weather.blood);
+            draw_sphere(eye + sky.moon_dir * 5000.0, 115.0 * (1.0 + 0.6 * weather.blood), None, col3(mc));
         }
 
         world_mat.set_uniform("CamPos", eye);
         world_mat.set_uniform("Under", if under { 1.0f32 } else { 0.0 });
         world_mat.set_uniform("Lum", sky.lum);
         world_mat.set_uniform("Bump", if st.bump { 1.0f32 } else { 0.0 });
+        world_mat.set_uniform("FogK", horror::fog_k(weather.fog));
         world_mat.set_uniform("SunDir", sky.light_dir);
         world_mat.set_uniform("SunCol", sky.light_col);
         world_mat.set_uniform("AmbCol", sky.amb);
         world_mat.set_uniform("FogCol", sky.horizon);
         world_mat.set_uniform("P0", lantern_hand + camup * 0.14);
-        world_mat.set_uniform("C0", if lit_now { vec3(1.0, 0.76, 0.42) * 2.4 * flick } else { Vec3::ZERO });
-        world_mat.set_uniform("P1", dock_lamps[0]);
-        world_mat.set_uniform("C1", vec3(1.0, 0.72, 0.38) * 2.6 * lamp_on);
-        world_mat.set_uniform("P2", dock_lamps[1]);
-        world_mat.set_uniform("C2", vec3(1.0, 0.72, 0.38) * 2.6 * lamp_on);
+        world_mat.set_uniform("C0", if lit_now { vec3(1.0, 0.76, 0.42) * 2.4 * flick * horror::lantern_flicker(time, sanity) } else { Vec3::ZERO });
+        // the boat's searchlight takes over one dock lamp, a burning flare the other
+        let (p1, c1) = if lit_boat { (boat.pos + boat.forward() * 7.0 + Vec3::Y * 2.5, vec3(1.0, 0.95, 0.8) * 5.5) } else { (dock_lamps[0], vec3(1.0, 0.72, 0.38) * 2.6 * lamp_on) };
+        let (p2, c2) = match flares.iter().filter(|f| f.pos.distance(eye) < 260.0).min_by(|a, b| a.pos.distance(eye).total_cmp(&b.pos.distance(eye))) {
+            Some(f) => (f.pos, vec3(1.0, 0.36, 0.22) * 7.0 * (f.life / 5.0).min(1.0) * (0.85 + 0.15 * (time * 23.0).sin())),
+            None => (dock_lamps[1], vec3(1.0, 0.72, 0.38) * 2.6 * lamp_on),
+        };
+        world_mat.set_uniform("P1", p1);
+        world_mat.set_uniform("C1", c1);
+        world_mat.set_uniform("P2", p2);
+        world_mat.set_uniform("C2", c2);
         world_mat.set_uniform("P3", plaza.fire_pos + Vec3::Y * 0.7);
         world_mat.set_uniform("C3", vec3(1.0, 0.55, 0.2) * 3.0 * fire_flick);
         dbg_log("sky done");
@@ -1741,8 +2208,54 @@ async fn session(first: bool) -> bool {
                 toasts.push_back(("Something enormous passes beneath you...".into(), 4.0));
             }
         }
+        // the night hunters: huge shapes under the surface, a fin when they come up
+        for s in &stalkers.list {
+            let d = s.pos.distance(eye);
+            if d < 230.0 && visible(s.pos, s.len * 0.6, eye, fwd, right) {
+                let charging = s.state == horror::StalkState::Charge;
+                let fp = FishPose { heading: s.heading, pitch: 0.0, roll: 0.0, t: time * if charging { 5.0 } else { 2.2 } + s.phase, amp: if charging { 0.9 } else { 0.55 }, open: if charging || s.state == horror::StalkState::Surface { 0.9 } else { 0.3 } };
+                fish::draw_fish(&mut dynmb, s.sp, s.pos, s.len, &fp, d < 60.0);
+                if s.pos.y > -2.4 && s.state != horror::StalkState::Surface {
+                    horror::draw_fin(&mut dynmb, s.pos, s.heading, (s.len * 0.18).clamp(0.4, 1.4), time);
+                }
+            }
+        }
+        // hallucinations: a figure at the edge of your sight, a fin that isn't there
+        if let Some(sh) = &haunt.shadow {
+            horror::draw_shadow(&mut dynmb, sh, feet, time);
+        }
+        if let Some((p, _, h)) = &haunt.fake_fin {
+            horror::draw_fin(&mut dynmb, *p, *h, 0.7, time);
+        }
+        // the traders and the pages the castaways left behind
+        for v in &isl.vendors {
+            if v.person.distance(eye) < 90.0 {
+                islands::draw_vendor(&mut dynmb, v, eye, time);
+            }
+        }
+        for (i, p) in isl.pages.iter().enumerate() {
+            if p.pos.distance(eye) < 60.0 {
+                islands::draw_page(&mut dynmb, p.pos, time, pro.has_page(p.id) && Some(i) != page_target);
+            }
+        }
+        // flares and the boat's searchlight lamp
+        for f in &flares {
+            if f.pos.distance(eye) < 500.0 {
+                let k = (f.life / 5.0).min(1.0) * (0.8 + 0.2 * (time * 19.0 + f.pos.x).sin());
+                blob(&mut dynmb, f.pos, Vec3::splat(0.2 + 0.1 * k), vec3(1.0, 0.55, 0.4) * k, 0.0, 6, 4, 0.0, |c, _| glow(c));
+                if f.vel.y.abs() > 0.1 {
+                    for t in 1..6 {
+                        let tp = f.pos - f.vel.normalize_or_zero() * (0.25 * t as f32);
+                        blob(&mut dynmb, tp, Vec3::splat(0.08 / (1.0 + t as f32 * 0.3)), vec3(1.0, 0.4, 0.2), 0.0, 5, 3, 0.0, |c, _| glow(c));
+                    }
+                }
+            }
+        }
+        if lit_boat {
+            blob(&mut dynmb, boat.pos + boat.forward() * 1.7 + Vec3::Y * 1.0, Vec3::splat(0.17), vec3(1.0, 0.97, 0.85), 0.0, 6, 4, 0.0, |c, _| glow(c));
+        }
         // boats: ours, and everybody else's
-        let own_view = BoatView { pos: boat.pos, yaw: boat.yaw, pitch: boat.pitch, roll: boat.roll, row_t: boat.row_t, row_amt: boat.row_amt, motor: has_key, engine: boat.engine, manned: riding, time };
+        let own_view = BoatView { pos: boat.pos, yaw: boat.yaw, pitch: boat.pitch, roll: boat.roll + boat.rock * (time * 7.0).sin() * 0.22, row_t: boat.row_t, row_amt: boat.row_amt, motor: has_engine, engine: boat.engine, manned: riding, time };
         if boat.pos.distance(eye) < 260.0 && (riding || visible(boat.pos, 3.0, eye, fwd, right)) {
             boat::draw_boat(&mut dynmb, &own_view);
         }
@@ -1753,7 +2266,7 @@ async fn session(first: bool) -> bool {
                 sfx.play(crate::audio::Snd::Motor, 0.5 + 0.4 * boat.engine);
             }
         }
-        if riding && boat.row_amt > 0.3 && !has_key {
+        if riding && boat.row_amt > 0.3 && !(has_engine && pro.fuel > 0.0) {
             let ph = (boat.row_t / TAU).floor();
             if ph != last_stroke {
                 last_stroke = ph;
@@ -1925,6 +2438,7 @@ async fn session(first: bool) -> bool {
         water_mat.set_uniform("Lum", sky.lum);
         water_mat.set_uniform("WQ", st.water_q as f32);
         water_mat.set_uniform("Time", time);
+        water_mat.set_uniform("FogK", horror::fog_k(weather.fog));
         dbg_log("world drawn");
         gl_use_material(&water_mat);
         for w in &water {
@@ -1937,6 +2451,11 @@ async fn session(first: bool) -> bool {
 
         // ---------- HUD ----------
         set_default_camera();
+        if fx_on {
+            if let Some(p) = &postfx {
+                p.present(&FxParams { time, cam: if st.camcorder { 1.0 } else { 0.0 }, dread, calm, grain: 1.0, pulse, blood: hurt, glitch: fx_glitch, bright: 1.0 });
+            }
+        }
         ui.begin();
         if under {
             draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.28, 0.38, 0.22 * sky.lum + 0.08));
@@ -1965,16 +2484,59 @@ async fn session(first: bool) -> bool {
                 }
             }
             // top-right: clock and money
+            let (chip_h, chip_gap, chip_y0) = (36.0 * hs, 8.0 * hs, 14.0 * hs);
+            let mut chip_y = chip_y0;
             if st.show_clock {
                 let hh = sky.clock.floor() as i32;
                 let mm = ((sky.clock - sky.clock.floor()) * 60.0) as i32;
                 let clock = format!("{:02}:{:02}", hh, mm);
-                let tw = measure_text(&clock, None, (26.0 * hs) as u16, 1.0).width;
-                shadow_text(&clock, sw - tw - 16.0, 30.0 * hs, 26.0 * hs, WHITE);
+                let tw = measure_text(&clock, None, (24.0 * hs) as u16, 1.0).width;
+                let cw = tw + chip_h + 14.0 * hs;
+                let cx0 = sw - cw - 16.0;
+                hud_chip(cx0, chip_y, cw, chip_h);
+                icon_clock(cx0 + chip_h * 0.55, chip_y + chip_h * 0.5, chip_h * 0.33, hh as f32, mm as f32);
+                draw_text(&clock, cx0 + chip_h * 1.0, chip_y + chip_h * 0.5 + 8.0 * hs, 24.0 * hs, WHITE);
+                chip_y += chip_h + chip_gap;
             }
-            let money = if nw.mode == NetMode::Off { format!("{} coins", coins) } else { format!("{} coins (shared)", coins) };
-            let tw = measure_text(&money, None, (26.0 * hs) as u16, 1.0).width;
-            shadow_text(&money, sw - tw - 16.0, 30.0 * hs + if st.show_clock { 28.0 * hs } else { 0.0 }, 26.0 * hs, Color::new(0.5, 0.95, 0.5, 1.0));
+            let money = if nw.mode == NetMode::Off { format!("{}", coins) } else { format!("{} (shared)", coins) };
+            let tw = measure_text(&money, None, (24.0 * hs) as u16, 1.0).width;
+            let mw = tw + chip_h + 14.0 * hs;
+            let mx0 = sw - mw - 16.0;
+            hud_chip(mx0, chip_y, mw, chip_h);
+            icon_coin(mx0 + chip_h * 0.55, chip_y + chip_h * 0.5, chip_h * 0.33);
+            draw_text(&money, mx0 + chip_h * 1.0, chip_y + chip_h * 0.5 + 8.0 * hs, 24.0 * hs, Color::new(1.0, 0.92, 0.55, 1.0));
+            chip_y += chip_h + chip_gap;
+            // level, sanity and (in the boat) fuel and hull gauges, top right
+            {
+                let bar = |x: f32, y: f32, w: f32, h: f32, frac: f32, col: Color, label: &str| {
+                    rr_fill(x - 2.0, y - 2.0, w + 4.0, h + 4.0, (h + 4.0) * 0.5, Color::new(0.0, 0.0, 0.0, 0.5));
+                    let fw = (w * frac.clamp(0.0, 1.0)).max(h);
+                    rr_fill(x, y, fw, h, h * 0.5, col);
+                    rr_fill(x + h * 0.4, y + h * 0.15, (fw - h * 0.8).max(0.0), h * 0.3, h * 0.15, Color::new(1.0, 1.0, 1.0, 0.25));
+                    shadow_text(label, x - measure_text(label, None, (16.0 * hs) as u16, 1.0).width - 8.0, y + h, 16.0 * hs, Color::new(0.88, 0.92, 0.95, 1.0));
+                };
+                let (bw, bh) = (150.0 * hs, 9.0 * hs);
+                let bx = sw - bw - 16.0;
+                let mut by = chip_y + 8.0 * hs;
+                bar(bx, by, bw, bh, progress::level_progress(pro.xp), Color::new(0.45, 0.75, 1.0, 0.95), &format!("Level {}", pro.level()));
+                by += 18.0 * hs;
+                if sanity < 96.0 || weather.night > 0.3 {
+                    let c = if sanity > 55.0 { Color::new(0.7, 0.9, 0.7, 0.95) } else if sanity > 25.0 { Color::new(0.95, 0.8, 0.3, 0.95) } else { Color::new(0.95, 0.25, 0.2, 0.95) };
+                    bar(bx, by, bw, bh, sanity / 100.0, c, "Sanity");
+                    by += 18.0 * hs;
+                }
+                if riding && has_engine {
+                    bar(bx, by, bw, bh, pro.fuel / pro.tank_size(), Color::new(0.95, 0.65, 0.2, 0.95), "Fuel");
+                    by += 18.0 * hs;
+                }
+                if riding && (pro.hp < 99.0 || pro.boat[progress::REINFORCED]) {
+                    bar(bx, by, bw, bh, pro.hp / 100.0, if pro.hp > 40.0 { Color::new(0.6, 0.75, 0.9, 0.95) } else { Color::new(0.95, 0.3, 0.25, 0.95) }, "Hull");
+                    by += 18.0 * hs;
+                }
+                if riding && pro.boat[progress::SEARCHLIGHT] {
+                    shadow_text(if search_on { "[F] Searchlight ON" } else { "[F] Searchlight off" }, bx, by + 12.0 * hs, 17.0 * hs, WHITE);
+                }
+            }
             if st.show_fps {
                 shadow_text(&format!("{:.0} FPS", fps_smooth), 14.0, 24.0 * hs, 22.0 * hs, Color::new(1.0, 1.0, 0.6, 1.0));
             }
@@ -2012,14 +2574,21 @@ async fn session(first: bool) -> bool {
                     Some(format!("[{}] Trade at the counter", ikey))
                 } else if tent_target {
                     Some(format!("[{}] Rest at the tent", ikey))
+                } else if let Some(i) = vendor_target {
+                    Some(format!("[{}] Trade with {}", ikey, isl.vendors[i].name))
+                } else if let Some(i) = page_target {
+                    Some(format!("[{}] {}", ikey, if pro.has_page(isl.pages[i].id) { "Read the page again" } else { "Pick up the page" }))
                 } else if coco_target.is_some() {
                     Some(format!("[{}] Pick up coconut", ikey))
                 } else {
                     None
                 };
                 if let Some(s) = prompt {
-                    let tw = measure_text(&s, None, (28.0 * hs) as u16, 1.0).width;
-                    shadow_text(&s, cx - tw * 0.5, cy + 60.0 * hs, 28.0 * hs, WHITE);
+                    let tw = measure_text(&s, None, (26.0 * hs) as u16, 1.0).width;
+                    let (ph, pw) = (40.0 * hs, tw + 40.0 * hs);
+                    rr_fill(cx - pw * 0.5, cy + 30.0 * hs, pw, ph, ph * 0.5, Color::new(0.03, 0.05, 0.08, 0.6));
+                    rr_line(cx - pw * 0.5, cy + 30.0 * hs, pw, ph, ph * 0.5, 1.2, Color::new(1.0, 1.0, 1.0, 0.2));
+                    draw_text(&s, cx - tw * 0.5, cy + 30.0 * hs + ph * 0.5 + 9.0 * hs, 26.0 * hs, WHITE);
                 }
             }
             // chat box and recent chat lines (bottom left, above the hotbar row)
@@ -2061,8 +2630,10 @@ async fn session(first: bool) -> bool {
             for (i, (s, t)) in toasts.iter().enumerate() {
                 let a = (t / 0.6).min(1.0);
                 let tw = measure_text(s, None, (24.0 * hs) as u16, 1.0).width;
-                let y = 120.0 * hs + i as f32 * 30.0 * hs;
-                draw_text(s, cx - tw * 0.5 + 1.5, y + 1.5, 24.0 * hs, Color::new(0.0, 0.0, 0.0, 0.65 * a));
+                let y = 120.0 * hs + i as f32 * 40.0 * hs;
+                let (ph, pw) = (34.0 * hs, tw + 36.0 * hs);
+                rr_fill(cx - pw * 0.5, y - 25.0 * hs, pw, ph, ph * 0.5, Color::new(0.03, 0.05, 0.08, 0.62 * a));
+                rr_line(cx - pw * 0.5, y - 25.0 * hs, pw, ph, ph * 0.5, 1.0, Color::new(1.0, 1.0, 1.0, 0.13 * a));
                 draw_text(s, cx - tw * 0.5, y, 24.0 * hs, Color::new(1.0, 0.95, 0.72, a));
             }
             // cast power meter (hold to charge; green = far and better fish)
@@ -2158,6 +2729,7 @@ async fn session(first: bool) -> bool {
                         let count = match k {
                             ItemKind::Coconut => Some(held),
                             ItemKind::Bait => Some(baits[bait_sel]),
+                            ItemKind::FlareGun => Some(pro.flares),
                             _ => None,
                         };
                         entries[i] = Some(HotbarEntry { kind: k, count, tier: rod_tier, lit: lantern_on, fish: fish_slots[i].map(|f| f.0).unwrap_or(0) });
@@ -2182,14 +2754,13 @@ async fn session(first: bool) -> bool {
             Screen::None => {}
             Screen::Pause(tab) => {
                 let mut tab = tab;
-                ui.rect(180.0, 60.0, 920.0, 600.0, COL_PANEL);
-                ui.outline(180.0, 60.0, 920.0, 600.0, 2.0, Color::new(1.0, 1.0, 1.0, 0.2));
+                ui.panel(180.0, 60.0, 920.0, 600.0, Color::new(0.35, 0.75, 0.8, 1.0));
                 ui.text("ISLAND", 205.0, 78.0, 34.0, Color::new(0.9, 0.95, 1.0, 1.0));
                 if ui.button(205.0, 135.0, 190.0, 44.0, "Resume", true, true) {
                     st.save();
                     screen = Screen::None;
                 }
-                let tabs = ["Graphics", "Display", "Controls", "Multiplayer", "Character"];
+                let tabs = ["Graphics", "Display", "Controls", "Multiplayer", "Character", "Journal"];
                 for (i, t) in tabs.iter().enumerate() {
                     let y = 195.0 + i as f32 * 54.0;
                     if ui.button(205.0, y, 190.0, 44.0, t, tab != i, false) {
@@ -2211,6 +2782,11 @@ async fn session(first: bool) -> bool {
                     0 => tab_graphics(&mut ui, &mut st, x, w),
                     1 => tab_display(&mut ui, &mut st, x, w),
                     2 => tab_controls(&mut ui, &mut st, &mut rebinding, x),
+                    5 => {
+                        if let Some(id) = tab_journal(&mut ui, &pro, x, w) {
+                            screen = Screen::Page(id);
+                        }
+                    }
                     4 => {
                         let before = look.clone();
                         let was_focus = name_focus;
@@ -2350,8 +2926,7 @@ async fn session(first: bool) -> bool {
             }
             Screen::Shop => {
                 let (px, py, pw, ph) = (190.0f32, 36.0f32, 900.0f32, 648.0f32);
-                ui.rect(px, py, pw, ph, COL_PANEL);
-                ui.outline(px, py, pw, ph, 2.0, Color::new(1.0, 0.9, 0.6, 0.35));
+                ui.panel(px, py, pw, ph, Color::new(0.95, 0.7, 0.35, 1.0));
                 ui.text("Trading Counter", px + 24.0, py + 14.0, 34.0, Color::new(1.0, 0.9, 0.6, 1.0));
                 let ctext = if nw.mode == NetMode::Off { format!("Coins: {}", coins) } else { format!("Coins: {} (shared)", coins) };
                 let cw = ui.text_w(&ctext, 28.0);
@@ -2415,6 +2990,9 @@ async fn session(first: bool) -> bool {
                     }
                     1 => {
                         for i in 0..N_RODS {
+                            if i >= HERMIT_RODS && !owned_rods[i] {
+                                continue; // the best rods are sold by the boat yard
+                            }
                             let y = top + i as f32 * 74.0;
                             let r = RODS[i];
                             let desc = if i == 0 { "A simple, reliable rod".to_string() } else { format!("Cast +{:.0}%  Reel +{:.0}%  Line strength x{:.1}  Better fish", (r.1 - 1.0) * 100.0, (r.2 - 1.0) * 100.0, r.8) };
@@ -2443,10 +3021,10 @@ async fn session(first: bool) -> bool {
                     }
                     2 => {
                         ui.text("One is used up per cast. Better bait means better and bigger fish.", lx, top - 6.0, 19.0, Color::new(0.7, 0.75, 0.8, 1.0));
-                        for i in 0..N_BAITS {
+                        for i in 0..HERMIT_BAITS {
                             let y = top + 22.0 + i as f32 * 62.0;
                             let b = BAITS[i];
-                            let extra = if i == N_BAITS - 1 { "   Draws the deep monsters" } else { "" };
+                            let extra = if i == 4 { "   Draws the deep monsters" } else { "" };
                             let desc = format!("Pack of {}   Luck +{:.0}%   Faster bites{}", b.4, b.1 * 100.0, extra);
                             if shop_row(&mut ui, lx, y, cw2, &format!("{}  (you have {})", b.0, baits[i]), &desc, &format!("{} coins", b.3), coins >= b.3 && hb_can_give(&hotbar, ItemKind::Bait), true) {
                                 add_coins(&mut coins, &mut nw, -b.3);
@@ -2468,7 +3046,7 @@ async fn session(first: bool) -> bool {
                             hb_give(&mut hotbar, ItemKind::Lantern);
                             shop_msg = "Click with it in hand to light it. Stay safe out there.".into();
                         }
-                        for i in 0..3 {
+                        for i in 0..HERMIT_UPGRADES {
                             let y = top + (i as f32 + 1.0) * 66.0;
                             let (name, desc, price) = UPGRADES[i];
                             if upg[i] {
@@ -2482,7 +3060,13 @@ async fn session(first: bool) -> bool {
                         }
                         let y = top + 4.0 * 66.0 + 8.0;
                         ui.text("Rowing boat", lx, y, 22.0, WHITE);
-                        let boat_note = if has_key { "You found the boat key: the outboard motor works (hold Shift for full throttle)." } else { "Moored by the dock. Rowing is free. Land a deep-water monster to find the boat key." };
+                        let boat_note = if has_engine {
+                            "Your outboard is fitted (hold Shift for full throttle). Gas and parts: the traders on the other islands."
+                        } else if has_key {
+                            "You have the boat key. The boat yard on the east island sells the outboard."
+                        } else {
+                            "Moored by the dock. Rowing is free. Land a deep-water monster to find the boat key."
+                        };
                         ui.text(boat_note, lx, y + 26.0, 17.0, Color::new(0.7, 0.75, 0.8, 1.0));
                     }
                 }
@@ -2490,10 +3074,141 @@ async fn session(first: bool) -> bool {
                     screen = Screen::None;
                     st.save();
                 }
-            }            Screen::Tent => {
+            }            Screen::Vendor(vi) => {
+                let vendor = &isl.vendors[vi.min(isl.vendors.len() - 1)];
+                let (px, py, pw, ph) = (190.0f32, 36.0f32, 900.0f32, 648.0f32);
+                ui.panel(px, py, pw, ph, Color::new(1.0, 0.78, 0.35, 1.0));
+                ui.text(vendor.name, px + 24.0, py + 14.0, 34.0, Color::new(1.0, 0.9, 0.6, 1.0));
+                let ctext = if nw.mode == NetMode::Off { format!("Coins: {}", coins) } else { format!("Coins: {} (shared)", coins) };
+                let cw = ui.text_w(&ctext, 28.0);
+                ui.text(&ctext, px + pw - 24.0 - cw, py + 18.0, 28.0, Color::new(0.5, 0.95, 0.5, 1.0));
+                ui.text(&format!("\"{}\"", vendor_msg), px + 24.0, py + 62.0, 20.0, Color::new(0.85, 0.85, 0.9, 1.0));
+                let (lx, cw2) = (px + 24.0, pw - 48.0);
+                for (k, good) in vendor.stock.iter().enumerate() {
+                    let y = py + 104.0 + k as f32 * 56.0;
+                    let row = good_row(*good, &pro, &owned_rods, rod_tier, &upg, &baits, has_key, &hotbar);
+                    let label = match row.state {
+                        GoodState::Owned => "Owned".to_string(),
+                        GoodState::Equip(on) => if on { "Equipped".to_string() } else { "Equip".to_string() },
+                        GoodState::Locked(_) => "Locked".to_string(),
+                        GoodState::Buy => format!("{} coins", row.price),
+                    };
+                    let enabled = match row.state {
+                        GoodState::Owned | GoodState::Locked(_) | GoodState::Equip(true) => false,
+                        GoodState::Equip(false) => true,
+                        GoodState::Buy => coins >= row.price,
+                    };
+                    let desc = match row.state {
+                        GoodState::Locked(why) => format!("{}  -  {}", row.desc, why),
+                        _ => row.desc.clone(),
+                    };
+                    ui.text(&row.name, lx, y, 21.0, WHITE);
+                    ui.text(&desc, lx, y + 24.0, 16.0, Color::new(0.7, 0.75, 0.8, 1.0));
+                    if ui.button(lx + cw2 - 150.0, y, 150.0, 44.0, &label, enabled, matches!(row.state, GoodState::Buy)) {
+                        match (*good, row.state) {
+                            (Good::Rod(i), GoodState::Equip(false)) => {
+                                rod_tier = i;
+                                hb_give(&mut hotbar, ItemKind::Rod);
+                                vendor_msg = format!("The {} suits you!", RODS[i].0);
+                            }
+                            (Good::Rod(i), GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                owned_rods[i] = true;
+                                rod_tier = i;
+                                hb_give(&mut hotbar, ItemKind::Rod);
+                                vendor_msg = format!("A fine rod. Enjoy the {}.", RODS[i].0);
+                            }
+                            (Good::Bait(i), GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                baits[i] += BAITS[i].4;
+                                bait_sel = i;
+                                hb_give(&mut hotbar, ItemKind::Bait);
+                                vendor_msg = format!("{} {} - good choice.", BAITS[i].4, BAITS[i].0);
+                            }
+                            (Good::Upgrade(i), GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                upg[i] = true;
+                                vendor_msg = format!("{} - that'll hold a bigger fish.", UPGRADES[i].0);
+                            }
+                            (Good::Boat(i), GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                pro.boat[i] = true;
+                                if i == progress::ENGINE {
+                                    pro.fuel = pro.fuel.max(pro.tank_size() * 0.3);
+                                    vendor_msg = "She'll start first pull. There's a little gas in her to get you going.".into();
+                                } else {
+                                    vendor_msg = format!("{} - fitted. Your boat will thank you.", progress::BOAT_UPGRADES[i].0);
+                                }
+                            }
+                            (Good::Gas, GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                pro.fuel = pro.tank_size();
+                                vendor_msg = "Tank's full. Don't run dry out there.".into();
+                            }
+                            (Good::Flares, GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                pro.flares = (pro.flares + progress::FLARE_PACK.0).min(999);
+                                vendor_msg = "Keep them dry. Fire them when something comes close.".into();
+                            }
+                            (Good::FlareGun, GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                hb_give(&mut hotbar, ItemKind::FlareGun);
+                                vendor_msg = "Point it at the sky and pull. Flares are sold separately.".into();
+                            }
+                            (Good::Repair, GoodState::Buy) => {
+                                add_coins(&mut coins, &mut nw, -row.price);
+                                sfx.play(crate::audio::Snd::Coin, 1.0);
+                                pro.hp = 100.0;
+                                vendor_msg = "Patched and sealed. Good as new.".into();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let total: i32 = (0..5).filter_map(|i| if hotbar[i] == Some(ItemKind::Fish) { fish_slots[i].map(|(f, kg)| fish::fish_value(f, kg)) } else { None }).sum();
+                if ui.button(px + pw - 24.0 - 330.0, py + ph - 62.0, 330.0, 42.0, &format!("Sell all fish ({} coins)", total), total > 0, true) {
+                    for i in 0..5 {
+                        if hotbar[i] == Some(ItemKind::Fish) {
+                            hotbar[i] = None;
+                            fish_slots[i] = None;
+                        }
+                    }
+                    add_coins(&mut coins, &mut nw, total);
+                    sfx.play(crate::audio::Snd::Coins, 1.0);
+                    vendor_msg = format!("A fine haul. Here's {} coins.", total);
+                }
+                if ui.button(lx, py + ph - 62.0, 160.0, 42.0, "Close", true, false) {
+                    screen = Screen::None;
+                    st.save();
+                }
+            }
+            Screen::Page(id) => {
+                let page = &islands::PAGES[id.min(progress::N_PAGES - 1)];
+                let (px, py, pw, ph) = (300.0f32, 90.0f32, 680.0f32, 540.0f32);
+                ui.rect(px, py, pw, ph, Color::new(0.82, 0.78, 0.66, 0.97));
+                ui.outline(px, py, pw, ph, 3.0, Color::new(0.35, 0.28, 0.18, 0.9));
+                let ink = Color::new(0.16, 0.12, 0.09, 1.0);
+                ui.text(page.title, px + 34.0, py + 28.0, 32.0, ink);
+                let mut ty = py + 84.0;
+                for l in wrap_lines(&ui, page.text, 23.0, pw - 68.0) {
+                    ui.text(&l, px + 34.0, ty, 23.0, ink);
+                    ty += 30.0;
+                }
+                if ui.button(px + pw * 0.5 - 90.0, py + ph - 66.0, 180.0, 44.0, "Put it away", true, false) {
+                    screen = Screen::None;
+                    st.save();
+                }
+            }
+            Screen::Tent => {
                 let (px, py, pw, ph) = (400.0f32, 150.0f32, 480.0f32, 420.0f32);
-                ui.rect(px, py, pw, ph, COL_PANEL);
-                ui.outline(px, py, pw, ph, 2.0, Color::new(1.0, 1.0, 1.0, 0.25));
+                ui.panel(px, py, pw, ph, Color::new(0.45, 0.8, 0.7, 1.0));
                 ui.text("Your tent", px + 24.0, py + 16.0, 34.0, Color::new(0.9, 0.95, 1.0, 1.0));
                 let hh = sky.clock.floor() as i32;
                 let mm = ((sky.clock - sky.clock.floor()) * 60.0) as i32;
@@ -2521,9 +3236,9 @@ async fn session(first: bool) -> bool {
                     }
                 }
                 if ui.button(bx, py + 220.0, bw, 46.0, "Save game", true, true) {
-                    let data = SaveData { coins, rod_tier, owned_rods, hotbar, fish_slots, baits, bait_sel, coconuts: held, lantern_on, best, sky_t, upg, has_key };
+                    let data = SaveData { coins, rod_tier, owned_rods, hotbar, fish_slots, baits, bait_sel, coconuts: held, lantern_on, best, sky_t, upg, has_key, pro: pro.clone() };
                     sfx.play(crate::audio::Snd::Chime, 0.8);
-                    tent_msg = if data.write() { "Game saved.".into() } else { "Couldn't write the save file.".into() };
+                    tent_msg = if data.write(save_slot) { "Game saved.".into() } else { "Couldn't write the save file.".into() };
                     st.save();
                 }
                 if ui.button(bx, py + 280.0, bw, 46.0, "Close", true, false) {

@@ -5,8 +5,9 @@ use super::*;
 // ---------------------------------------------------------------------------
 // Fishing data
 // ---------------------------------------------------------------------------
-pub const N_RODS: usize = 4;
-pub const N_BAITS: usize = 5;
+pub const N_RODS: usize = 5;
+pub const N_BAITS: usize = 7;
+pub const N_UPG: usize = 4;
 
 /// (name, cast range x, reel speed x, luck, bite-time x, price, blank colour, wrap colour, line strength)
 pub const RODS: [(&str, f32, f32, f32, f32, i32, [f32; 3], [f32; 3], f32); N_RODS] = [
@@ -14,6 +15,7 @@ pub const RODS: [(&str, f32, f32, f32, f32, i32, [f32; 3], [f32; 3], f32); N_ROD
     ("Fiberglass Rod", 1.25, 1.35, 0.25, 0.85, 120, [0.15, 0.40, 0.18], [0.95, 0.85, 0.25], 1.8),
     ("Carbon Pro Rod", 1.5, 1.8, 0.55, 0.7, 400, [0.06, 0.06, 0.09], [0.95, 0.30, 0.10], 3.5),
     ("Titan Rod", 1.8, 2.3, 0.9, 0.6, 1500, [0.50, 0.53, 0.60], [0.15, 0.80, 0.95], 6.5),
+    ("Deep Sea Rod", 2.1, 2.8, 1.3, 0.5, 3800, [0.08, 0.10, 0.22], [0.85, 0.12, 0.70], 11.0),
 ];
 
 /// (name, luck, bite-time x, pack price, pack size)
@@ -23,13 +25,16 @@ pub const BAITS: [(&str, f32, f32, i32, u32); N_BAITS] = [
     ("Squid Strip", 0.50, 0.65, 110, 8),
     ("Lucky Lure", 0.65, 0.55, 150, 5),
     ("Abyss Glow Lure", 1.10, 0.50, 420, 3),
+    ("Silver Spoon", 1.40, 0.48, 520, 6),
+    ("Drowned Lure", 2.20, 0.35, 3000, 2),
 ];
 
 /// Gear upgrades: (name, description, price)
-pub const UPGRADES: [(&str, &str, i32); 3] = [
+pub const UPGRADES: [(&str, &str, i32); N_UPG] = [
     ("Braided Line", "Stronger line: +25% before it snaps", 180),
     ("Steel Leader", "Heavy-duty leader: +60% line strength", 650),
     ("Pro Reel", "Smooth drag: +25% reeling power", 420),
+    ("Master Reel", "Machined gears: another +25% reeling power", 2400),
 ];
 
 /// Everything about one fish fight. Drive it with `fight_step`.
@@ -330,6 +335,8 @@ pub enum ItemKind {
     Bucket = 4,
     /// a caught fish; which one is stored next to the hotbar slot
     Fish = 5,
+    /// shoots a flare that lights the sky and keeps the hunters away (ammo is counted separately)
+    FlareGun = 6,
 }
 
 impl ItemKind {
@@ -341,6 +348,7 @@ impl ItemKind {
             3 => Some(ItemKind::Bait),
             4 => Some(ItemKind::Bucket),
             5 => Some(ItemKind::Fish),
+            6 => Some(ItemKind::FlareGun),
             _ => None,
         }
     }
@@ -931,4 +939,22 @@ pub fn draw_bucket(mb: &mut MB, pos: Vec3, up: Vec3) {
     for s in [-1.0f32, 1.0] {
         blob(mb, hi + b * (s * r_top * 1.05) - u * 0.008, vec3(0.0075, 0.0075, 0.0075), rope * 0.8, 0.0, 6, 3, 0.0, shade);
     }
+}
+
+/// A chunky orange flare pistol held at `pos`, the barrel pointing along `dir`.
+pub fn draw_flare_gun(mb: &mut MB, pos: Vec3, dir: Vec3, up: Vec3) {
+    let f = dir.normalize_or_zero();
+    let s = f.cross(up).normalize_or_zero();
+    if f == Vec3::ZERO || s == Vec3::ZERO {
+        return;
+    }
+    let u = s.cross(f);
+    let orange = vec3(0.92, 0.42, 0.08);
+    let black = vec3(0.07, 0.07, 0.08);
+    cyl(mb, pos, pos + f * 0.20, 0.030, 0.032, orange, 10);
+    cyl(mb, pos + f * 0.20, pos + f * 0.22, 0.036, 0.036, black, 10);
+    obox(mb, pos - f * 0.04 - u * 0.03, [f, u, s], vec3(0.085, 0.036, 0.030), orange * 0.9);
+    beam(mb, pos - f * 0.07 - u * 0.04, pos - f * 0.12 - u * 0.17, 0.05, 0.04, black);
+    ring(mb, pos - f * 0.025 - u * 0.075, s, 0.03, 0.005, black, 8);
+    blob(mb, pos - f * 0.085 + u * 0.005, Vec3::splat(0.022), vec3(0.75, 0.75, 0.78), 0.0, 5, 3, 0.0, shade);
 }

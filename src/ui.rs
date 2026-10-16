@@ -1,4 +1,4 @@
-﻿//! Key bindings, settings and the immediate-mode UI toolkit.
+//! Key bindings, settings and the immediate-mode UI toolkit.
 
 use super::*;
 use std::path::PathBuf;
@@ -249,6 +249,10 @@ pub struct Settings {
     pub update_repo: String,
     /// the player's chosen name (empty = "Player N")
     pub name: String,
+    /// which save slot (0..4) was used last
+    pub slot: usize,
+    /// found-footage look: film grain, scan lines and a rolling tracking line
+    pub camcorder: bool,
 }
 
 impl Settings {
@@ -275,6 +279,8 @@ impl Settings {
             vsync: true,
             update_repo: crate::update::DEFAULT_REPO.to_string(),
             name: String::new(),
+            slot: 0,
+            camcorder: false,
         };
         s.apply_preset(2);
         s
@@ -340,7 +346,9 @@ impl Settings {
                     "detail" => s.detail = v.parse::<usize>().unwrap_or(2).min(3),
                     "auto_update" => s.auto_update = bo(),
                     "vsync" => s.vsync = bo(),
+                    "camcorder" => s.camcorder = bo(),
                     "name" => s.name = crate::net::clean_name(v),
+                    "slot" => s.slot = v.parse::<usize>().unwrap_or(0).min(crate::game::SLOTS - 1),
                     "update_repo" => {
                         if v.contains('/') && v.len() < 100 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '-' || c == '_' || c == '.') {
                             s.update_repo = v.to_string();
@@ -370,7 +378,7 @@ impl Settings {
         t += &format!("res={}\nfullscreen={}\nfps={}\npreset={}\ndraw_dist={}\nwater_q={}\nbump={}\n", self.res, b(self.fullscreen), self.fps, self.preset, self.draw_dist, self.water_q, b(self.bump));
         t += &format!("show_fps={}\nshow_clock={}\nshow_hints={}\nsens={}\ninvert_y={}\nfov={}\n", b(self.show_fps), b(self.show_clock), b(self.show_hints), self.sens, b(self.invert_y), self.fov);
         t += &format!("detail={}\nlook={}\nvolume={}\n", self.detail.min(3), self.look, self.volume);
-        t += &format!("auto_update={}\nupdate_repo={}\nvsync={}\nname={}\n", b(self.auto_update), self.update_repo, b(self.vsync), self.name);
+        t += &format!("auto_update={}\nupdate_repo={}\nvsync={}\nname={}\nslot={}\ncamcorder={}\n", b(self.auto_update), self.update_repo, b(self.vsync), self.name, self.slot, b(self.camcorder));
         for (i, a) in ACTS.iter().enumerate() {
             t += &format!("bind.{}={}\n", act_id(*a), bind_to_str(self.binds[i]));
         }
@@ -433,11 +441,84 @@ impl Ui {
     pub fn hover(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
         self.mx >= x && self.mx <= x + w && self.my >= y && self.my <= y + h
     }
+    /// corner radius (screen pixels) for a box of this size: soft, never more than a pill
+    fn radius(&self, w: f32, h: f32) -> f32 {
+        (w.min(h) * 0.22).min(16.0) * self.scale
+    }
     pub fn rect(&self, x: f32, y: f32, w: f32, h: f32, c: Color) {
-        draw_rectangle(self.ox + x * self.scale, self.oy + y * self.scale, w * self.scale, h * self.scale, c);
+        let (sx, sy, sw, sh) = (self.ox + x * self.scale, self.oy + y * self.scale, w * self.scale, h * self.scale);
+        rr_fill(sx, sy, sw, sh, self.radius(w, h), c);
     }
     pub fn outline(&self, x: f32, y: f32, w: f32, h: f32, t: f32, c: Color) {
-        draw_rectangle_lines(self.ox + x * self.scale, self.oy + y * self.scale, w * self.scale, h * self.scale, t * self.scale, c);
+        let (sx, sy, sw, sh) = (self.ox + x * self.scale, self.oy + y * self.scale, w * self.scale, h * self.scale);
+        rr_line(sx, sy, sw, sh, self.radius(w, h), t * self.scale, c);
+    }
+    /// A rich window: layered gradient, woven texture, grain, a slow drifting light sweep, a glowing
+    /// two-tone rim and corner studs. `accent` tints the rim, the sweep and the studs.
+    pub fn panel(&self, x: f32, y: f32, w: f32, h: f32, accent: Color) {
+        let sc = self.scale;
+        let (sx, sy, sw, sh) = (self.ox + x * sc, self.oy + y * sc, w * sc, h * sc);
+        let r = 16.0 * sc;
+        let t = get_time() as f32;
+        // shadow and body
+        rr_fill(sx + 4.0 * sc, sy + 8.0 * sc, sw, sh, r, rgba(0.0, 0.0, 0.0, 0.38));
+        rr_grad(sx, sy, sw, sh, r, rgba(0.11, 0.16, 0.22, 0.96), rgba(0.04, 0.05, 0.09, 0.97));
+        // warm glow from the accent colour in the lower corner
+        let (ix, iy, iw, ih) = (sx + r * 0.6, sy + r * 0.6, sw - r * 1.2, sh - r * 1.2);
+        grad_v(ix, iy + ih * 0.55, iw, ih * 0.45, rgba(accent.r, accent.g, accent.b, 0.0), rgba(accent.r, accent.g, accent.b, 0.10));
+        // woven texture: fine diagonal hatching, clipped to the inner box
+        let step = 7.0 * sc;
+        let mut k = -ih;
+        while k < iw {
+            let (x0, y0) = (ix + k.max(0.0), iy + (-k).max(0.0));
+            let len = (iw - k.max(0.0)).min(ih - (-k).max(0.0));
+            if len > 0.0 {
+                draw_line(x0, y0, x0 + len, y0 + len, 1.0, rgba(1.0, 1.0, 1.0, 0.028));
+            }
+            k += step;
+        }
+        // grain
+        let mut hsh = 0x9E37_79B9u32;
+        for _ in 0..420 {
+            hsh = hsh.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let px = ix + (hsh >> 8) as f32 / 16_777_216.0 * iw;
+            hsh = hsh.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let py = iy + (hsh >> 8) as f32 / 16_777_216.0 * ih;
+            draw_rectangle(px, py, 1.6 * sc, 1.6 * sc, rgba(1.0, 1.0, 1.0, 0.05 + 0.05 * ((hsh & 7) as f32 / 7.0)));
+        }
+        // top sheen
+        grad_v(ix, iy, iw, ih * 0.32, rgba(1.0, 1.0, 1.0, 0.07), rgba(1.0, 1.0, 1.0, 0.0));
+        // a soft band of light drifting across
+        let bw = iw * 0.22;
+        let bx = ix - bw + (iw + bw) * ((t * 0.07).fract());
+        let (l, rr_) = (bx.max(ix), (bx + bw).min(ix + iw));
+        if rr_ > l {
+            let mid = bx + bw * 0.5;
+            let a = rgba(accent.r, accent.g, accent.b, 0.0);
+            let b = rgba(accent.r, accent.g, accent.b, 0.07);
+            if mid > l && mid < rr_ {
+                grad_h(l, iy, mid - l, ih, a, b);
+                grad_h(mid, iy, rr_ - mid, ih, b, a);
+            }
+        }
+        // rim: outer glow, bright accent edge, inner hairline
+        rr_line(sx - 2.0 * sc, sy - 2.0 * sc, sw + 4.0 * sc, sh + 4.0 * sc, r + 2.0 * sc, 4.0 * sc, rgba(accent.r, accent.g, accent.b, 0.13));
+        rr_line(sx, sy, sw, sh, r, 2.0 * sc, rgba(accent.r, accent.g, accent.b, 0.85));
+        rr_line(sx + 5.0 * sc, sy + 5.0 * sc, sw - 10.0 * sc, sh - 10.0 * sc, r - 4.0 * sc, 1.0, rgba(1.0, 1.0, 1.0, 0.09));
+        // a bright line along the top edge that fades out to the sides
+        grad_h(sx + r, sy + 1.0, sw * 0.5 - r, 2.0 * sc, rgba(accent.r, accent.g, accent.b, 0.0), rgba(1.0, 1.0, 1.0, 0.7));
+        grad_h(sx + sw * 0.5, sy + 1.0, sw * 0.5 - r, 2.0 * sc, rgba(1.0, 1.0, 1.0, 0.7), rgba(accent.r, accent.g, accent.b, 0.0));
+        // studs in the corners
+        for (cx, cy) in [(sx + 14.0 * sc, sy + 14.0 * sc), (sx + sw - 14.0 * sc, sy + 14.0 * sc), (sx + 14.0 * sc, sy + sh - 14.0 * sc), (sx + sw - 14.0 * sc, sy + sh - 14.0 * sc)] {
+            draw_circle(cx, cy, 3.6 * sc, rgba(0.0, 0.0, 0.0, 0.5));
+            draw_circle(cx, cy - 0.5 * sc, 2.6 * sc, rgba(accent.r, accent.g, accent.b, 0.9));
+            draw_circle(cx - 0.8 * sc, cy - 1.2 * sc, 0.9 * sc, rgba(1.0, 1.0, 1.0, 0.8));
+        }
+    }
+    /// a vertical gradient box with the same soft corners
+    pub fn rect_grad(&self, x: f32, y: f32, w: f32, h: f32, top: Color, bot: Color) {
+        let (sx, sy, sw, sh) = (self.ox + x * self.scale, self.oy + y * self.scale, w * self.scale, h * self.scale);
+        rr_grad(sx, sy, sw, sh, self.radius(w, h), top, bot);
     }
     pub fn text(&self, s: &str, x: f32, y: f32, size: f32, c: Color) {
         draw_text(s, self.ox + x * self.scale, self.oy + (y + size * 0.78) * self.scale, size * self.scale, c);
@@ -460,8 +541,10 @@ impl Ui {
         } else {
             COL_BTN
         };
-        self.rect(x, y, w, h, bg);
-        self.outline(x, y, w, h, 1.5, Color::new(1.0, 1.0, 1.0, if hot { 0.5 } else { 0.18 }));
+        // soft drop shadow, a gradient face and a faint rim
+        self.rect(x, y + 2.5, w, h, Color::new(0.0, 0.0, 0.0, if on { 0.28 } else { 0.12 }));
+        self.rect_grad(x, y, w, h, brighten(bg, if on { 0.07 } else { 0.0 }), Color::new(bg.r * 0.82, bg.g * 0.82, bg.b * 0.82, bg.a));
+        self.outline(x, y, w, h, 1.2, Color::new(1.0, 1.0, 1.0, if hot { 0.55 } else { 0.14 }));
         let tc = if on { WHITE } else { Color::new(0.5, 0.5, 0.55, 1.0) };
         self.text_c(label, x + w * 0.5, y + h * 0.5, 22.0, tc);
         let hit = on && hot && self.clicked;
@@ -504,8 +587,12 @@ impl Ui {
         let bx = x + w - bw;
         self.rect(bx, y + 15.0, bw, 8.0, Color::new(0.1, 0.12, 0.16, 1.0));
         let t = ((*v - lo) / (hi - lo)).clamp(0.0, 1.0);
-        self.rect(bx, y + 15.0, bw * t, 8.0, COL_ACCENT);
-        self.rect(bx + bw * t - 7.0, y + 6.0, 14.0, 26.0, WHITE);
+        self.rect(bx, y + 15.0, (bw * t).max(8.0), 8.0, COL_ACCENT);
+        // a round knob
+        let (kx, ky) = (self.ox + (bx + bw * t) * self.scale, self.oy + (y + 19.0) * self.scale);
+        draw_circle(kx, ky + 1.5 * self.scale, 11.0 * self.scale, Color::new(0.0, 0.0, 0.0, 0.3));
+        draw_circle(kx, ky, 11.0 * self.scale, WHITE);
+        draw_circle(kx, ky, 5.0 * self.scale, COL_ACCENT);
         self.text(show, bx - 70.0, y + 8.0, 20.0, Color::new(0.8, 0.85, 0.9, 1.0));
         let mut changed = false;
         if self.clicked && self.hover(bx - 8.0, y, bw + 16.0, 38.0) {
@@ -569,7 +656,7 @@ fn rr_pts(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<Vec2> {
     if r < 0.5 {
         return vec![vec2(x, y), vec2(x + w, y), vec2(x + w, y + h), vec2(x, y + h)];
     }
-    let seg = 6;
+    let seg = 9;
     let mut v = Vec::with_capacity(4 * (seg + 1));
     let corners = [(x + w - r, y + r, -PI * 0.5), (x + w - r, y + h - r, 0.0), (x + r, y + h - r, PI * 0.5), (x + r, y + r, PI)];
     for (cx, cy, a0) in corners {
@@ -580,7 +667,7 @@ fn rr_pts(x: f32, y: f32, w: f32, h: f32, r: f32) -> Vec<Vec2> {
     }
     v
 }
-fn rr_grad(x: f32, y: f32, w: f32, h: f32, r: f32, top: Color, bot: Color) {
+pub(crate) fn rr_grad(x: f32, y: f32, w: f32, h: f32, r: f32, top: Color, bot: Color) {
     let pts = rr_pts(x, y, w, h, r);
     let n = pts.len();
     let mut verts = Vec::with_capacity(n + 1);
@@ -596,16 +683,41 @@ fn rr_grad(x: f32, y: f32, w: f32, h: f32, r: f32, top: Color, bot: Color) {
     }
     draw_mesh(&Mesh { vertices: verts, indices: idx, texture: None });
 }
-fn rr_fill(x: f32, y: f32, w: f32, h: f32, r: f32, c: Color) {
+pub(crate) fn rr_fill(x: f32, y: f32, w: f32, h: f32, r: f32, c: Color) {
     rr_grad(x, y, w, h, r, c, c);
 }
-fn rr_line(x: f32, y: f32, w: f32, h: f32, r: f32, t: f32, c: Color) {
+pub(crate) fn rr_line(x: f32, y: f32, w: f32, h: f32, r: f32, t: f32, c: Color) {
     let pts = rr_pts(x, y, w, h, r);
     let n = pts.len();
     for i in 0..n {
         let (a, b) = (pts[i], pts[(i + 1) % n]);
         draw_line(a.x, a.y, b.x, b.y, t, c);
     }
+}
+
+/// A frosted pill behind HUD readouts (screen pixels).
+pub fn hud_chip(x: f32, y: f32, w: f32, h: f32) {
+    rr_fill(x, y + 2.0, w, h, h * 0.5, Color::new(0.0, 0.0, 0.0, 0.22));
+    rr_grad(x, y, w, h, h * 0.5, Color::new(0.12, 0.16, 0.22, 0.80), Color::new(0.04, 0.06, 0.09, 0.80));
+    rr_line(x, y, w, h, h * 0.5, 1.2, Color::new(1.0, 1.0, 1.0, 0.16));
+}
+
+/// A little clock face showing `hour` (0..24) and `minute`.
+pub fn icon_clock(cx: f32, cy: f32, r: f32, hour: f32, minute: f32) {
+    draw_circle(cx, cy, r, Color::new(0.92, 0.94, 0.98, 1.0));
+    draw_circle(cx, cy, r * 0.86, Color::new(0.14, 0.18, 0.26, 1.0));
+    let ha = (hour % 12.0 + minute / 60.0) / 12.0 * TAU - PI * 0.5;
+    let ma = minute / 60.0 * TAU - PI * 0.5;
+    draw_line(cx, cy, cx + ha.cos() * r * 0.5, cy + ha.sin() * r * 0.5, r * 0.16, WHITE);
+    draw_line(cx, cy, cx + ma.cos() * r * 0.74, cy + ma.sin() * r * 0.74, r * 0.11, Color::new(0.75, 0.88, 1.0, 1.0));
+}
+
+/// A gold coin.
+pub fn icon_coin(cx: f32, cy: f32, r: f32) {
+    draw_circle(cx, cy, r, Color::new(0.72, 0.5, 0.08, 1.0));
+    draw_circle(cx, cy - r * 0.04, r * 0.88, Color::new(1.0, 0.82, 0.25, 1.0));
+    draw_circle_lines(cx, cy, r * 0.58, r * 0.12, Color::new(0.78, 0.55, 0.1, 1.0));
+    draw_circle(cx - r * 0.28, cy - r * 0.3, r * 0.14, Color::new(1.0, 0.96, 0.7, 0.9));
 }
 
 fn bold_text(s: &str, x: f32, y: f32, size: f32, c: Color) {
@@ -676,6 +788,7 @@ fn item_cols(k: crate::items::ItemKind) -> (Color, Color, &'static str) {
     use crate::items::ItemKind as K;
     match k {
         K::Fish => (rgb(0.08, 0.17, 0.26), rgb(0.20, 0.45, 0.62), "FISH"),
+        K::FlareGun => (rgb(0.26, 0.09, 0.05), rgb(0.88, 0.38, 0.10), "FLARES"),
         K::Rod => (rgb(0.08, 0.20, 0.19), rgb(0.17, 0.52, 0.42), "ROD"),
         K::Coconut => (rgb(0.20, 0.15, 0.07), rgb(0.50, 0.42, 0.17), "COCONUT"),
         K::Lantern => (rgb(0.30, 0.15, 0.05), rgb(0.86, 0.48, 0.10), "LANTERN"),
@@ -830,6 +943,28 @@ fn icon_bucket(ix: f32, iy: f32, z: f32) {
     draw_circle(eye.x, eye.y - 0.01 * z, 0.014 * z, BLACK);
 }
 
+/// A flare pistol with a little burst of sparks.
+fn icon_flare(ix: f32, iy: f32, z: f32, tm: f32) {
+    let p = |a: f32, b: f32| vec2(ix + a * z, iy + b * z);
+    let orange = rgb(0.95, 0.45, 0.10);
+    let black = rgb(0.10, 0.10, 0.12);
+    let (a, b) = (p(0.20, 0.56), p(0.78, 0.40));
+    draw_line(a.x, a.y, b.x, b.y, 0.15 * z, orange);
+    draw_line(b.x - 0.02 * z, b.y, b.x + 0.04 * z, b.y - 0.01 * z, 0.17 * z, black);
+    let g0 = p(0.30, 0.60);
+    let g1 = p(0.24, 0.84);
+    draw_line(g0.x, g0.y, g1.x, g1.y, 0.12 * z, black);
+    // sparks
+    let k = 0.6 + 0.4 * (tm * 9.0).sin();
+    for i in 0..7 {
+        let ang = i as f32 * 0.9 + tm * 2.0;
+        let c = p(0.86, 0.26) + vec2(ang.cos(), ang.sin()) * (0.10 * z * k);
+        draw_circle(c.x, c.y, 0.02 * z, rgb(1.0, 0.8 - 0.05 * i as f32, 0.25));
+    }
+    let c = p(0.86, 0.26);
+    draw_circle(c.x, c.y, 0.045 * z, rgb(1.0, 0.95, 0.7));
+}
+
 /// A little fish picture in the species' own colours.
 fn icon_fish(ix: f32, iy: f32, z: f32, sp: usize, tm: f32) {
     let s = &crate::fish::SPECIES[sp.min(crate::fish::N_SPECIES - 1)];
@@ -871,7 +1006,7 @@ fn draw_tile(x: f32, y: f32, ss: f32, hh: f32, hs: f32, e: &HotbarEntry, sel: bo
     // header strip
     draw_rectangle(x, y, ss, hh, rgba(0.02, 0.03, 0.05, 0.62));
     let label = if matches!(e.kind, crate::items::ItemKind::Rod) {
-        format!("{} {}", name, ["I", "II", "III", "IV"][e.tier.min(3)])
+        format!("{} {}", name, ["I", "II", "III", "IV", "V"][e.tier.min(4)])
     } else {
         name.to_string()
     };
@@ -895,6 +1030,7 @@ fn draw_tile(x: f32, y: f32, ss: f32, hh: f32, hs: f32, e: &HotbarEntry, sel: bo
         K::Bait => icon_bait(ix, iy, isz),
         K::Bucket => icon_bucket(ix, iy, isz),
         K::Fish => icon_fish(ix, iy, isz, e.fish, tm),
+        K::FlareGun => icon_flare(ix, iy, isz, tm),
     }
     // count badge
     if let Some(n) = e.count {
@@ -1395,12 +1531,12 @@ pub fn tab_graphics(ui: &mut Ui, st: &mut Settings, x: f32, w: f32) {
     }
     ui.text("Applies the next time the world loads", x, 420.0, 16.0, NOTE);
     let fov_txt = format!("{:.0}", st.fov);
-    ui.slider(2, x, 452.0, w, "Field of view", &mut st.fov, 55.0, 110.0, &fov_txt);
-    ui.toggle(x, 512.0, w, "Show FPS counter", &mut st.show_fps);
-    ui.toggle(x, 516.0, w, "VSync (smoother, restart to apply)", &mut st.vsync);
-    ui.text("Presets change draw distance, water, surface and model detail.", x, 568.0, 17.0, NOTE);
+    ui.slider(2, x, 444.0, w, "Field of view", &mut st.fov, 55.0, 110.0, &fov_txt);
+    ui.toggle(x, 496.0, w, "Show FPS counter", &mut st.show_fps);
+    ui.toggle(x, 536.0, w, "VSync (smoother, restart to apply)", &mut st.vsync);
+    ui.toggle(x, 576.0, w, "Camcorder look (grain, scan lines, tracking)", &mut st.camcorder);
     let vol_txt = format!("{:.0}%", st.volume * 100.0);
-    ui.slider(4, x, 600.0, w, "Master volume", &mut st.volume, 0.0, 1.0, &vol_txt);
+    ui.slider(4, x, 616.0, w, "Master volume", &mut st.volume, 0.0, 1.0, &vol_txt);
 }
 
 pub fn tab_display(ui: &mut Ui, st: &mut Settings, x: f32, w: f32) {
@@ -1605,9 +1741,11 @@ pub enum Launch {
 }
 
 pub struct MenuChoice {
-    /// true = start a fresh game (ignore the save file)
+    /// true = start a fresh game in slot (ignore any save there)
     pub new_game: bool,
     pub launch: Launch,
+    /// which of the five save slots this game uses
+    pub slot: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1616,6 +1754,7 @@ enum Page {
     Multi,
     Character,
     Settings,
+    Slots,
 }
 
 const MB_X: f32 = 88.0;
@@ -1665,11 +1804,7 @@ fn wrap_lines(ui: &Ui, s: &str, size: f32, maxw: f32) -> Vec<String> {
 }
 
 fn panel(ui: &Ui, x: f32, y: f32, w: f32, h: f32) {
-    let (sx, sy, sw, sh, sc) = (ui.ox + x * ui.scale, ui.oy + y * ui.scale, w * ui.scale, h * ui.scale, ui.scale);
-    rr_fill(sx + 3.0 * sc, sy + 5.0 * sc, sw, sh, 12.0 * sc, rgba(0.0, 0.0, 0.0, 0.3));
-    rr_fill(sx, sy, sw, sh, 12.0 * sc, Color::new(0.06, 0.08, 0.11, 0.93));
-    rr_line(sx, sy, sw, sh, 12.0 * sc, 1.5 * sc, rgba(1.0, 1.0, 1.0, 0.18));
-    draw_rectangle(sx + 14.0 * sc, sy, sw - 28.0 * sc, 3.0 * sc, COL_ACCENT);
+    ui.panel(x, y, w, h, COL_ACCENT);
 }
 
 fn sanitize_code(s: &str) -> String {
@@ -1679,7 +1814,7 @@ fn sanitize_code(s: &str) -> String {
 /// The title screen. Runs its own frame loop (calling `next_frame().await`) until the player picks
 /// Play / Host / Join. It owns Settings editing (Graphics, Display, Controls) and the character
 /// customization screen. `Quit` saves the settings and exits the process.
-pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save: bool, mat: &Material) -> MenuChoice {
+pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, mat: &Material) -> MenuChoice {
     show_mouse(true);
     set_cursor_grab(false);
     let t0 = get_time();
@@ -1691,7 +1826,7 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
     let mut name_focus = false;
     let mut status = String::new();
     let mut hov = [0.0f32; 16];
-    let mut confirm_new = -100.0f32;
+    let mut confirm_del: Option<(usize, f32)> = None;
     // the occasional deep bloop from the dark water
     let bloop = macroquad::audio::load_sound_from_bytes(&bloop_wav()).await.ok();
     let mut next_bloop = 4.0f32;
@@ -1747,20 +1882,9 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                         r
                     }};
                 }
-                if has_save {
-                    if mb!("Continue", 1) {
-                        go = Some(MenuChoice { new_game: false, launch: Launch::Solo });
-                    }
-                    let armed = t - confirm_new < 4.0;
-                    if mb!(if armed { "Click again to confirm" } else { "New game" }, if armed { 2 } else { 0 }) {
-                        if armed {
-                            go = Some(MenuChoice { new_game: true, launch: Launch::Solo });
-                        } else {
-                            confirm_new = t;
-                        }
-                    }
-                } else if mb!("Play", 1) {
-                    go = Some(MenuChoice { new_game: true, launch: Launch::Solo });
+                if mb!("Play", 1) {
+                    page = Page::Slots;
+                    confirm_del = None;
                 }
                 if mb!("Multiplayer", 0) {
                     page = Page::Multi;
@@ -1787,6 +1911,47 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                     st.save();
                 }
                 ui.text(&format!("v{}  -  Esc: back   F11: fullscreen", crate::update::CURRENT), MB_X, 690.0, 15.0, rgba(1.0, 1.0, 1.0, 0.4));
+            }
+            Page::Slots => {
+                if menu_button(ui, &mut hov[0], MB_X, 600.0, MB_W, MB_H, "Back", 0, dt) || esc {
+                    page = Page::Main;
+                }
+                panel(ui, 420.0, 46.0, 720.0, 630.0);
+                let x = 450.0;
+                ui.text("Choose a save slot", x, 70.0, 30.0, WHITE);
+                ui.text("Five separate islands. In multiplayer the host's slot is the world; yours keeps your own gear and progress.", x, 106.0, 16.0, NOTE);
+                for i in 0..crate::game::SLOTS {
+                    let y = 138.0 + i as f32 * 100.0;
+                    ui.rect(x, y, 660.0, 90.0, Color::new(0.10, 0.13, 0.18, 1.0));
+                    ui.outline(x, y, 660.0, 90.0, 1.5, if st.slot == i { COL_ACCENT } else { Color::new(1.0, 1.0, 1.0, 0.14) });
+                    ui.text(&format!("Slot {}", i + 1), x + 16.0, y + 10.0, 26.0, WHITE);
+                    match crate::game::slot_info(i) {
+                        Some(info) => {
+                            ui.text(&format!("Day {}   -   Level {}   -   {} coins", info.day, info.level, info.coins), x + 16.0, y + 44.0, 20.0, Color::new(0.8, 0.9, 1.0, 1.0));
+                            ui.text(&format!("{}   -   saved {}", info.rod, info.saved), x + 16.0, y + 66.0, 16.0, NOTE);
+                            if ui.button(x + 430.0, y + 22.0, 120.0, 46.0, "Continue", true, true) {
+                                st.slot = i;
+                                go = Some(MenuChoice { new_game: false, launch: Launch::Solo, slot: i });
+                            }
+                            let armed = matches!(confirm_del, Some((s, tm)) if s == i && t - tm < 4.0);
+                            if ui.button(x + 560.0, y + 22.0, 90.0, 46.0, if armed { "Sure?" } else { "Delete" }, true, false) {
+                                if armed {
+                                    crate::game::delete_slot(i);
+                                    confirm_del = None;
+                                } else {
+                                    confirm_del = Some((i, t));
+                                }
+                            }
+                        }
+                        None => {
+                            ui.text("Empty", x + 16.0, y + 48.0, 20.0, Color::new(1.0, 1.0, 1.0, 0.4));
+                            if ui.button(x + 430.0, y + 22.0, 220.0, 46.0, "New game", true, true) {
+                                st.slot = i;
+                                go = Some(MenuChoice { new_game: true, launch: Launch::Solo, slot: i });
+                            }
+                        }
+                    }
+                }
             }
             Page::Settings => {
                 let names = ["Graphics", "Display", "Controls"];
@@ -1819,14 +1984,21 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                 let x = 450.0;
                 ui.text("Multiplayer (up to 4 players)", x, 76.0, 30.0, WHITE);
                 if ui.button(x, 130.0, 280.0, 50.0, "Host a game", true, true) {
-                    go = Some(MenuChoice { new_game: !has_save, launch: Launch::Host });
+                    go = Some(MenuChoice { new_game: !crate::game::slot_exists(st.slot), launch: Launch::Host, slot: st.slot });
                 }
                 let mut ly = 136.0;
                 for l in wrap_lines(ui, "Start a game on this computer. Once you are on the island the game shows you a LAN code for friends on your network and an internet code for friends anywhere.", 17.0, 330.0) {
                     ui.text(&l, x + 300.0, ly, 17.0, NOTE);
                     ly += 21.0;
                 }
-                ui.rect(x, 232.0, 640.0, 1.0, rgba(1.0, 1.0, 1.0, 0.12));
+                ui.text("Save slot (* = has a save)", x, 188.0, 16.0, rgb(0.8, 0.85, 0.9));
+                for i in 0..crate::game::SLOTS {
+                    let label = format!("{}{}", i + 1, if crate::game::slot_exists(i) { "*" } else { "" });
+                    if ui.button(x + i as f32 * 56.0, 204.0, 50.0, 26.0, &label, true, st.slot == i) {
+                        st.slot = i;
+                    }
+                }
+                ui.rect(x, 238.0, 640.0, 1.0, rgba(1.0, 1.0, 1.0, 0.12));
                 ui.text("Join a friend's game", x, 252.0, 24.0, WHITE);
                 ui.text("Room code (or the host's IP address):", x, 292.0, 19.0, rgb(0.8, 0.85, 0.9));
                 ui.rect(x, 322.0, 360.0, 48.0, Color::new(0.1, 0.12, 0.16, 1.0));
@@ -1865,7 +2037,7 @@ pub async fn main_menu(ui: &mut Ui, st: &mut Settings, look: &mut Look, has_save
                     if join_text.is_empty() {
                         status = "Type a room code first.".into();
                     } else {
-                        go = Some(MenuChoice { new_game: !has_save, launch: Launch::Join(join_text.clone()) });
+                        go = Some(MenuChoice { new_game: !crate::game::slot_exists(st.slot), launch: Launch::Join(join_text.clone()), slot: st.slot });
                     }
                 }
                 ui.text("Click the box and type, or press Ctrl+V to paste.", x, 380.0, 16.0, NOTE);
